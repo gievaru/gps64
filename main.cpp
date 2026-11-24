@@ -38,7 +38,8 @@
 #define GPS_LINE_B      0
 #define GPS_LINE_A      255
 
-MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64, DK22Pac & juicermv & RusJJ)
+#define GPS_BUILD "r6"
+MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r6, DK22Pac & juicermv & RusJJ)
 NEEDGAME(com.rockstargames.gtasa)
 
 /* ------------------------------------------------------------------ */
@@ -168,6 +169,7 @@ void (*PathMakeRequest)(uintptr_t, float, float, float, float);   // minX, maxX,
 void (*PathUpdateStreaming)(uintptr_t, bool);
 void (*PathReleaseRequested)(uintptr_t);
 int  (*PathFindRegion)(uintptr_t, float, float);
+void (*PathLoadScene)(uintptr_t, CVector);
 bool bLongRoutes = true, bPauseForceLoad = true;
 unsigned g_routeLogs = 0;
 void (*ClearRadarBlip)(int);
@@ -517,10 +519,30 @@ static bool AStarRoute(CVector from, CVector to, bool boat, RouteCache& rc)
 /* ------------------------------------------------------------------ */
 /* Asking the game to keep the needed path-node regions loaded        */
 /* ------------------------------------------------------------------ */
+static inline int RegionIdx(float v)
+{
+    int i = (int)floorf((v + 3000.0f) / 750.0f);
+    return i < 0 ? 0 : (i > 7 ? 7 : i);
+}
+
+// Number of outdoor regions overlapping the rectangle that are not in memory; also returns the centre of the first one.
+static int CountMissingRegions(float minX, float maxX, float minY, float maxY, float* cx, float* cy)
+{
+    int missing = 0;
+    for(int iy = RegionIdx(minY); iy <= RegionIdx(maxY); ++iy)
+        for(int ix = RegionIdx(minX); ix <= RegionIdx(maxX); ++ix)
+            if(!RegionNodes(iy * 8 + ix))
+            {
+                if(missing == 0) { *cx = -3000.0f + 750.0f * (ix + 0.5f); *cy = -3000.0f + 750.0f * (iy + 0.5f); }
+                ++missing;
+            }
+    return missing;
+}
+
 static void RequestNodesFor(CVector a, CVector b)
 {
     if(!PathMakeRequest) return;
-    static unsigned s_tick = 0, s_lastReq = 0, s_lastForce = 0;
+    static unsigned s_tick = 0, s_lastReq = 0, s_lastForce = 0, s_noProgress = 0, s_forceLogs = 0;
     static float s_last[4] = {0, 0, 0, 0};
     static bool s_reqActive = false;
     ++s_tick;
@@ -533,24 +555,37 @@ static void RequestNodesFor(CVector a, CVector b)
         PathMakeRequest((uintptr_t)ThePaths, minX, maxX, minY, maxY);
         s_last[0] = minX; s_last[1] = maxX; s_last[2] = minY; s_last[3] = maxY;
         s_lastReq = s_tick; s_reqActive = true;
-        if(g_routeLogs < 40) Dbg("STREAM request x=[%.0f..%.0f] y=[%.0f..%.0f] mapMode=%d loadedMask=0x%llx", minX, maxX, minY, maxY, (int)g_mapMode, (unsigned long long)LoadedSignature());
+        if(g_routeLogs < 40)
+            Dbg("STREAM request x=[%.0f..%.0f] y=[%.0f..%.0f] mapMode=%d loaded=0x%llx | stored: active=%d x=[%.0f..%.0f] y=[%.0f..%.0f]",
+                minX, maxX, minY, maxY, (int)g_mapMode, (unsigned long long)LoadedSignature(),
+                (int)At<bool>(ThePaths, 19600), At<float>(ThePaths, 19604), At<float>(ThePaths, 19608), At<float>(ThePaths, 19612), At<float>(ThePaths, 19616));
     }
-    // On the pause map the game loop does not run its own streaming, so push it by hand when regions are missing.
-    if(g_mapMode && bPauseForceLoad && PathUpdateStreaming && PathFindRegion && s_tick - s_lastForce > 20)
+
+    if(!g_mapMode && (s_tick % 300) == 1)
     {
-        int missing = 0;
-        for(int iy = 0; iy < 8; ++iy) for(int ix = 0; ix < 8; ++ix)
-        {
-            float cx = -3000.0f + 750.0f * (ix + 0.5f), cy = -3000.0f + 750.0f * (iy + 0.5f);
-            if(cx + 375 < minX || cx - 375 > maxX || cy + 375 < minY || cy - 375 > maxY) continue;
-            int r = PathFindRegion((uintptr_t)ThePaths, cx, cy);
-            if(r >= 0 && r < PATH_REGIONS && !RegionNodes(r)) ++missing;
-        }
+        float cx0 = 0, cy0 = 0;
+        Dbg("STREAM in-game: loaded=0x%llx missing in route rect=%d", (unsigned long long)LoadedSignature(), CountMissingRegions(minX, maxX, minY, maxY, &cx0, &cy0));
+    }
+
+    // On the pause map the game loop does not run its own streaming, so load the missing regions by hand.
+    if(g_mapMode && bPauseForceLoad && s_tick - s_lastForce > 8)
+    {
+        float cx = 0, cy = 0;
+        int missing = CountMissingRegions(minX, maxX, minY, maxY, &cx, &cy);
         if(missing > 0)
         {
             s_lastForce = s_tick;
-            PathUpdateStreaming((uintptr_t)ThePaths, true);
-            if(g_routeLogs < 40) Dbg("STREAM forced update, %d region(s) were missing, loadedMask now 0x%llx", missing, (unsigned long long)LoadedSignature());
+            uint64_t before = LoadedSignature();
+            const char* how = "none";
+            if(PathLoadScene && s_noProgress < 3) { CVector c = {cx, cy, 0.0f}; PathLoadScene((uintptr_t)ThePaths, c); how = "LoadScene"; }
+            else if(PathUpdateStreaming)            { PathUpdateStreaming((uintptr_t)ThePaths, true); how = "UpdateStreaming(true)"; s_noProgress = 0; }
+            uint64_t after = LoadedSignature();
+            if(after == before) ++s_noProgress; else s_noProgress = 0;
+            if(s_forceLogs < 60)
+            {
+                ++s_forceLogs;
+                Dbg("STREAM force via %s at (%.0f %.0f): missing=%d, loaded 0x%llx -> 0x%llx", how, cx, cy, missing, (unsigned long long)before, (unsigned long long)after);
+            }
         }
     }
 }
@@ -927,6 +962,7 @@ static uintptr_t Sym(const char* name)
 extern "C" void OnModLoad()
 {
     logger->SetTag("GPS AML");
+    Dbg("=== GPS64 build %s (%s %s) - long routes: own A* + path-node streaming ===", GPS_BUILD, __DATE__, __TIME__);
     pGTASA = aml->GetLib("libGTASA.so");
     hGTASA = dlopen("libGTASA.so", RTLD_LAZY);
 
@@ -1006,7 +1042,8 @@ extern "C" void OnModLoad()
     PathUpdateStreaming  = (void(*)(uintptr_t, bool))aml->GetSym(hGTASA, "_ZN9CPathFind15UpdateStreamingEb");
     PathReleaseRequested = (void(*)(uintptr_t))aml->GetSym(hGTASA, "_ZN9CPathFind21ReleaseRequestedNodesEv");
     PathFindRegion       = (int(*)(uintptr_t, float, float))aml->GetSym(hGTASA, "_ZN9CPathFind19FindRegionForCoorsEff");
-    Dbg("streaming api: make=%p update=%p release=%p region=%p", (void*)PathMakeRequest, (void*)PathUpdateStreaming, (void*)PathReleaseRequested, (void*)PathFindRegion);
+    PathLoadScene        = (void(*)(uintptr_t, CVector))aml->GetSym(hGTASA, "_ZN9CPathFind21LoadSceneForPathNodesE7CVector");
+    Dbg("streaming api: make=%p update=%p release=%p loadScene=%p", (void*)PathMakeRequest, (void*)PathUpdateStreaming, (void*)PathReleaseRequested, (void*)PathLoadScene);
     uintptr_t radarHud = Sym("_ZN4CHud9DrawRadarEv");
     uintptr_t gangOverlay = Sym("_ZN6CRadar20DrawRadarGangOverlayEb");
     if(g_missing)
@@ -1026,5 +1063,5 @@ extern "C" void OnModLoad()
 
     // TODO (phase 2): port the path-node limit / streaming-radius patches of DoPathSearch
     //                 and CPathFind::UpdateStreaming (Thumb-2 patches in the 32-bit version).
-    logger->Info("GPS 1.2.1-arm64 loaded (milestone 1, no node-limit patches)");
+    logger->Info("GPS 1.2.1-arm64 build %s loaded", GPS_BUILD);
 }
