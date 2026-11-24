@@ -156,7 +156,7 @@ void* (*GetPoolVeh)(int);
 void* (*GetPoolObj)(int);
 
 void (*FontSetOrientation)(unsigned char);
-void (*FontSetColor)(uint32_t);          // CRGBA by value == one 32-bit register
+void (*FontSetColor)(RGBA*);            // CRGBA has a destructor => the ARM64 ABI passes it by reference (crash proved it)
 void (*FontSetBackground)(unsigned char, unsigned char);
 void (*FontSetWrapx)(float);
 void (*FontSetStyle)(unsigned char);
@@ -323,7 +323,9 @@ static void DrawDistanceText()
         col = TraceRGBA(At<uint32_t>(g_pMissionTrace, OFF_TR_COLOUR), (At<uint8_t>(g_pMissionTrace, OFF_TR_FLAGS1) >> 3) & 1);
 
     FontSetOrientation(g_nTextAlignment);
-    FontSetColor(PackRGBA(col));
+    static RGBA s_textColor;
+    s_textColor = col;
+    FontSetColor(&s_textColor);
     FontSetBackground(false, false);
     FontSetWrapx(500.0f);
     FontSetScale(textScale);
@@ -349,7 +351,13 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
                  MAX_NODE_POINTS, dist ? dist : &trashVar, 1000000.0f, NULL, 1000000.0f, false,
                  invalid, false, isBoat && bAllowBoat);
 
-    if(g_logNow) Dbg("DoPathDraw: DoPathSearch nodes=%d dist=%.1f target=(%.1f %.1f %.1f)", (int)nodesCount, dist ? *dist : trashVar, to.x, to.y, to.z);
+    static unsigned s_calls = 0;
+    static int s_lastNodes = -2;
+    ++s_calls;
+    if(s_calls <= 20 || (s_calls % 120) == 0 || nodesCount != s_lastNodes)
+        Dbg("DoPathDraw#%u: DoPathSearch nodes=%d dist=%.1f player=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)", s_calls, (int)nodesCount,
+            dist ? *dist : trashVar, GetEntityPos(player).x, GetEntityPos(player).y, GetEntityPos(player).z, to.x, to.y, to.z);
+    s_lastNodes = nodesCount;
     if(nodesCount <= 0) return;
 
     if(isTargetBlip && gpsDistance < pCfgClosestMaxGPSDistance->GetFloat())
@@ -424,6 +432,15 @@ DECL_HOOKv(DrawRadarHook)
             Dbg("  blip: idx=%d refInTrace=%u refInHandle=%u pos=(%.1f %.1f %.1f) sprite=%d colour=%u",
                 mb & 0xFFFF, (unsigned)At<uint16_t>(t, OFF_TR_REFINDEX), (unsigned)((uint32_t)mb >> 16), tp.x, tp.y, tp.z,
                 (int)At<int8_t>(t, OFF_TR_SPRITE), (unsigned)At<uint32_t>(t, OFF_TR_COLOUR));
+        }
+    }
+    {
+        static int s_lastMenuBlip = 0;
+        int mb2 = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
+        if(mb2 != s_lastMenuBlip)
+        {
+            s_lastMenuBlip = mb2;
+            Dbg("f=%u menuBlip changed -> %d (idx %d, ref %d) paused=%d", g_frame, mb2, mb2 & 0xFFFF, (int)((uint32_t)mb2 >> 16), (int)IsGamePaused());
         }
     }
     if(IsGamePaused()) return; // pause-map drawing is not ported yet (radar-visible check dropped: widget slot is NULL in 2.10)
