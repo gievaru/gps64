@@ -120,6 +120,8 @@ uint8_t g_nTextAlignment;
 int g_targetBlip = 0;
 void* g_pMissionTrace = NULL;
 bool g_bInited = false, g_bTextInited = false;
+bool g_mapMode = false;   // true while drawing on the pause map
+float mapScale = 1.0f;
 
 CVector2D g_vecUnderRadar = {0.0f, -1.05f};
 CVector2D g_vecAboveRadar = {0.0f, 1.05f};
@@ -265,6 +267,7 @@ static void InitializeConfigValues()
 {
     float w = (float)At<int>(RsGlobal, OFF_RS_WIDTH), h = (float)At<int>(RsGlobal, OFF_RS_HEIGHT);
     textOffset = (8.0f * h) / 448.0f;
+    mapScale = 0.00223214285f * h; // same factor the 32-bit mod used on the pause map
     textScale = (0.4f * w / 640.0f) * pCfgGPSDrawDistanceTextScale->GetFloat();
     if(sscanf(pCfgGPSDrawDistanceTextOffset->GetString(), "%f %f", &vecTextOffset.x, &vecTextOffset.y) != 2)
         vecTextOffset.x = vecTextOffset.y = 0;
@@ -362,7 +365,7 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
     s_lastNodes = nodesCount;
     if(nodesCount <= 0) return;
 
-    if(isTargetBlip && gpsDistance < pCfgClosestMaxGPSDistance->GetFloat())
+    if(isTargetBlip && !g_mapMode && gpsDistance < pCfgClosestMaxGPSDistance->GetFloat())
     {
         ClearRadarBlip(g_targetBlip);
         At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP) = 0;
@@ -377,10 +380,30 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
         if(!table) continue;
         uint8_t* node = table + SIZEOF_PATHNODE * resultNodes[i].index;
         CVector2D nodePos = { At<int16_t>(node, OFF_NODE_X) / 8.0f, At<int16_t>(node, OFF_NODE_Y) / 8.0f };
-        TransformRealWorldPointToRadarSpace(radarPts[good], nodePos);
+        if(g_mapMode)
+        {
+            CVector2D rp;
+            TransformRealWorldPointToRadarSpace(rp, nodePos);
+            LimitRadarPoint(rp);
+            TransformRadarPointToScreenSpace(radarPts[good], rp);
+            radarPts[good].x *= mapScale;
+            radarPts[good].y *= mapScale;
+        }
+        else TransformRealWorldPointToRadarSpace(radarPts[good], nodePos);
         ++good;
     }
     if(g_logNow) Dbg("DoPathDraw: good nodes=%d", (int)good);
+    if(g_mapMode)
+    {
+        static unsigned s_mapCalls = 0;
+        if(good > 0 && (s_mapCalls < 12 || (s_mapCalls % 90) == 0))
+            Dbg("MAP#%u nodes=%d first=(%.1f %.1f) last=(%.1f %.1f) | scale=%.3f off=(%.1f %.1f) area=(%.1f %.1f) disp=%d mapMode=%d mapScale=%.3f",
+                s_mapCalls, (int)good, radarPts[0].x, radarPts[0].y, radarPts[good - 1].x, radarPts[good - 1].y,
+                At<float>(gMobileMenu, 120), At<float>(gMobileMenu, 124), At<float>(gMobileMenu, 128),
+                At<float>(gMobileMenu, 132), At<float>(gMobileMenu, 136),
+                (int)At<bool>(gMobileMenu, 140), (int)At<bool>(gMobileMenu, 141), mapScale);
+        ++s_mapCalls;
+    }
     if(good < 2) return;
 
     if(!g_bTextInited) { g_bTextInited = true; SetDistanceTextValues(); }
@@ -393,22 +416,30 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
     for(short i = 0; i < good - 1; i++)
     {
         CVector2D P0 = radarPts[i], P1 = radarPts[i + 1];
-        CVector2D d = { P1.x - P0.x, P1.y - P0.y };
-        float qa = d.x * d.x + d.y * d.y;
-        if(qa < 1e-9f) continue;
-        float qb = P0.x * d.x + P0.y * d.y;
-        float qc = P0.x * P0.x + P0.y * P0.y - R * R;
-        float disc = qb * qb - qa * qc;
-        if(disc <= 0.0f) continue;
-        float sq = sqrtf(disc);
-        float t0 = (-qb - sq) / qa, t1 = (-qb + sq) / qa;
-        if(t0 < 0.0f) t0 = 0.0f;
-        if(t1 > 1.0f) t1 = 1.0f;
-        if(t0 >= t1) continue;
-        CVector2D Q0 = { P0.x + d.x * t0, P0.y + d.y * t0 }, Q1 = { P0.x + d.x * t1, P0.y + d.y * t1 };
         CVector2D S0, S1;
-        TransformRadarPointToScreenSpace(S0, Q0);
-        TransformRadarPointToScreenSpace(S1, Q1);
+        if(g_mapMode)
+        {
+            S0 = P0; S1 = P1;
+            if(fabsf(S1.x - S0.x) + fabsf(S1.y - S0.y) < 1e-4f) continue;
+        }
+        else
+        {
+            CVector2D d = { P1.x - P0.x, P1.y - P0.y };
+            float qa = d.x * d.x + d.y * d.y;
+            if(qa < 1e-9f) continue;
+            float qb = P0.x * d.x + P0.y * d.y;
+            float qc = P0.x * P0.x + P0.y * P0.y - R * R;
+            float disc = qb * qb - qa * qc;
+            if(disc <= 0.0f) continue;
+            float sq = sqrtf(disc);
+            float t0 = (-qb - sq) / qa, t1 = (-qb + sq) / qa;
+            if(t0 < 0.0f) t0 = 0.0f;
+            if(t1 > 1.0f) t1 = 1.0f;
+            if(t0 >= t1) continue;
+            CVector2D Q0 = { P0.x + d.x * t0, P0.y + d.y * t0 }, Q1 = { P0.x + d.x * t1, P0.y + d.y * t1 };
+            TransformRadarPointToScreenSpace(S0, Q0);
+            TransformRadarPointToScreenSpace(S1, Q1);
+        }
         float angle = atan2f(S1.y - S0.y, S1.x - S0.x);
         CVector2D o0 = { cosf(angle - 1.5707963f) * lineWidth, sinf(angle - 1.5707963f) * lineWidth };
         CVector2D o1 = { cosf(angle + 1.5707963f) * lineWidth, sinf(angle + 1.5707963f) * lineWidth };
@@ -440,9 +471,10 @@ static bool EnsureInit()
     return true;
 }
 
-static void DoGpsFrame()
+static void DoGpsFrame(bool map)
 {
-    if(IsGamePaused()) return; // pause-map drawing is not ported yet
+    if(!map && IsGamePaused()) return;
+    g_mapMode = map;
     // Player-set map waypoint
     int menuBlip = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
     int idx = menuBlip & 0xFFFF;
@@ -525,16 +557,39 @@ static void DoGpsFrame()
             }
         }
     }
-
+    g_mapMode = false;
 }
 
 // Drawn from inside the radar drawing (after the map), like the original mod did.
 DECL_HOOKv(DrawRadarGangHook, bool b)
 {
     DrawRadarGangHook(b);
-    if(g_lineDone || !EnsureInit()) return;
+    if(!EnsureInit()) return;
+    if(b) { DoGpsFrame(true); return; } // pause map
+    if(g_lineDone) return;
     g_lineDone = true;
-    DoGpsFrame();
+    DoGpsFrame(false);
+}
+
+// Diagnostics only: where the game itself draws the player arrow on the pause map.
+DECL_HOOKv(YouAreHereHook, float x, float y)
+{
+    YouAreHereHook(x, y);
+    static unsigned n = 0;
+    static float lx = -1e9f, ly = -1e9f;
+    if(n < 60 && (fabsf(x - lx) > 1.0f || fabsf(y - ly) > 1.0f))
+    {
+        ++n; lx = x; ly = y;
+        CVector pp = GetEntityPos(FindPlayerPed(-1));
+        CVector2D w = {pp.x, pp.y}, rp, lim, sp = {0, 0};
+        TransformRealWorldPointToRadarSpace(rp, w);
+        lim = rp; LimitRadarPoint(lim);
+        TransformRadarPointToScreenSpace(sp, lim);
+        Dbg("ARROW args=(%.1f %.1f) | pipeline radar=(%.3f %.3f) screen=(%.1f %.1f) scaled=(%.1f %.1f) | menu scale=%.3f off=(%.1f %.1f) area=(%.1f %.1f) disp=%d mapMode=%d",
+            x, y, rp.x, rp.y, sp.x, sp.y, sp.x * mapScale, sp.y * mapScale,
+            At<float>(gMobileMenu, 120), At<float>(gMobileMenu, 124), At<float>(gMobileMenu, 128),
+            At<float>(gMobileMenu, 132), At<float>(gMobileMenu, 136), (int)At<bool>(gMobileMenu, 140), (int)At<bool>(gMobileMenu, 141));
+    }
 }
 
 DECL_HOOKv(DrawRadarHook)
@@ -577,7 +632,7 @@ DECL_HOOKv(DrawRadarHook)
     if(g_frame == 1 || g_logNow) Dbg("  line drawn from the gang-overlay hook this frame: %d", (int)g_lineDone);
     if(IsGamePaused()) return; // pause-map drawing is not ported yet (radar-visible check dropped: widget slot is NULL in 2.10)
 
-    if(!g_lineDone) { g_lineDone = true; DoGpsFrame(); } // fallback if the gang-overlay hook did not run
+    if(!g_lineDone) { g_lineDone = true; DoGpsFrame(false); } // fallback if the gang-overlay hook did not run
     DrawDistanceText();
 }
 
@@ -677,6 +732,10 @@ extern "C" void OnModLoad()
     }
     HOOK(DrawRadarHook, radarHud);
     HOOK(DrawRadarGangHook, gangOverlay);
+    // Diagnostics only. The symbol is not in the dynamic table, so use its address from the 2.10 arm64 build.
+    uintptr_t arrowFn = aml->GetSym(hGTASA, "_ZN6CRadar21DrawYouAreHereSpriteEff");
+    if(!arrowFn && pGTASA) arrowFn = pGTASA + 0x5262A0;
+    if(arrowFn) HOOK(YouAreHereHook, arrowFn);
     Dbg("loaded: ThePaths=%p gMobileMenu=%p RsGlobal=%p trace=%p widgets=%p pickups=%p DoPathSearch=%p hook=%p",
         ThePaths, gMobileMenu, RsGlobal, pRadarTrace, aWidgets, aPickUps, (void*)DoPathSearch, (void*)radarHud);
 
