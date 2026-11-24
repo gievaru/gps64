@@ -38,8 +38,8 @@
 #define GPS_LINE_B      0
 #define GPS_LINE_A      255
 
-#define GPS_BUILD "r8"
-MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r8, DK22Pac & juicermv & RusJJ)
+#define GPS_BUILD "r9"
+MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r9, DK22Pac & juicermv & RusJJ)
 NEEDGAME(com.rockstargames.gtasa)
 
 /* ------------------------------------------------------------------ */
@@ -171,7 +171,8 @@ void (*PathReleaseRequested)(uintptr_t);
 int  (*PathFindRegion)(uintptr_t, float, float);
 void (*PathLoadScene)(uintptr_t, CVector);
 void (*StreamLoadAll)(bool);   // CStreaming::LoadAllRequestedModels(bool): synchronous, works on the pause map
-bool bLongRoutes = true, bPauseForceLoad = true;
+bool bLongRoutes = true, bPauseForceLoad = true, bIgnoreClosedRoads = true;
+int g_astarReached = 0;
 unsigned g_routeLogs = 0;
 void (*ClearRadarBlip)(int);
 bool (*IsOnAMission)();
@@ -376,7 +377,8 @@ static inline CVector NodePos3(uint8_t* n)
 static inline bool NodeUsable(uint8_t* n, bool boat)
 {
     uint8_t f = At<uint8_t>(n, OFF_NODE_FLAGS);
-    if(f & (1 << 5)) return false;                 // switched off
+    // The story script switches roads off until a region is unlocked; for a GPS line they still count
+    if(!bIgnoreClosedRoads && (f & (1 << 5))) return false;
     bool water = (f >> 7) & 1;
     return boat ? water : !water;
 }
@@ -496,6 +498,8 @@ static bool AStarRoute(CVector from, CVector to, bool boat, RouteCache& rc)
             }
         }
     }
+    g_astarReached = 0;
+    for(int i = 0; i < total; ++i) if(s_closed[i]) ++g_astarReached;
     if(!found) return false;
 
     // rebuild the path (goal -> start) and reverse it
@@ -603,6 +607,29 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
 
     if(bLongRoutes) RequestNodesFor(from, to);
 
+    {
+        static int s_statLogs = 0;
+        static uint64_t s_lastStatSig = 0;
+        uint64_t sg = LoadedSignature();
+        if(s_statLogs < 4 && sg != s_lastStatSig && __builtin_popcountll(sg) >= 40)
+        {
+            s_lastStatSig = sg; ++s_statLogs;
+            int cars = 0, off = 0, water = 0, regions = 0;
+            for(int r = 0; r < PATH_REGIONS; ++r)
+            {
+                if(!RegionNodes(r)) continue;
+                int c = RegionCars(r); if(c <= 0 || c > RegionCount(r) || c > 20000) continue;
+                ++regions;
+                for(int i = 0; i < c; ++i)
+                {
+                    uint8_t f = At<uint8_t>(NodeAt(r, i), OFF_NODE_FLAGS);
+                    ++cars; if(f & (1 << 5)) ++off; if((f >> 7) & 1) ++water;
+                }
+            }
+            Dbg("ROADS: regions=%d carNodes=%d switchedOff=%d water=%d (ignoreClosedRoads=%d)", regions, cars, off, water, (int)bIgnoreClosedRoads);
+        }
+    }
+
     // 1) our own search (no node limits, works over every loaded region)
     bool haveRoute = false;
     if(bLongRoutes)
@@ -637,8 +664,8 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
                 CNodeAddress inv = {0xFFFF, 0xFFFF};
                 DoPathSearch((uintptr_t)ThePaths, false, from, inv, to, resultNodes, &gn, MAX_NODE_POINTS, &gd, 1000000.0f, NULL, 1000000.0f, false, inv, false, boatNavi);
                 float straight = sqrtf((from.x - to.x) * (from.x - to.x) + (from.y - to.y) * (from.y - to.y));
-                Dbg("ROUTE#%u mapMode=%d straight=%.0f | own: ok=%d nodes=%d len=%.0f | game: nodes=%d dist=%.0f | loadedRegions=%d",
-                    g_routeLogs, (int)g_mapMode, straight, (int)ok, ok ? rc.n : 0, ok ? rc.len : 0.0f, (int)gn, gd, __builtin_popcountll(sig));
+                Dbg("ROUTE#%u mapMode=%d straight=%.0f | own: ok=%d nodes=%d len=%.0f reached=%d start=%d goal=%d | game: nodes=%d dist=%.0f | loadedRegions=%d",
+                    g_routeLogs, (int)g_mapMode, straight, (int)ok, ok ? rc.n : 0, ok ? rc.len : 0.0f, g_astarReached, sId, gId, (int)gn, gd, __builtin_popcountll(sig));
             }
         }
     }
@@ -988,6 +1015,7 @@ extern "C" void OnModLoad()
     pCfgGPSDrawDistanceTextOffset = cfg->Bind("GPSDrawDistanceTextOffset", "0.0 0.0");
     bLongRoutes = cfg->Bind("LongRoutes", true)->GetBool();            // own route search + path-node streaming
     bPauseForceLoad = cfg->Bind("PauseMapForceLoad", true)->GetBool(); // push node streaming by hand on the pause map
+    bIgnoreClosedRoads = cfg->Bind("IgnoreClosedRoads", true)->GetBool(); // route through roads the story script has switched off
     bAllowBMX = cfg->Bind("AllowBMX", false)->GetBool();
     bAllowBoat = cfg->Bind("AllowBoatNavi", true)->GetBool();
     bAllowMission = cfg->Bind("MissionRoutes", true)->GetBool();
