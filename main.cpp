@@ -38,8 +38,8 @@
 #define GPS_LINE_B      0
 #define GPS_LINE_A      255
 
-#define GPS_BUILD "r7"
-MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r7, DK22Pac & juicermv & RusJJ)
+#define GPS_BUILD "r8"
+MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r8, DK22Pac & juicermv & RusJJ)
 NEEDGAME(com.rockstargames.gtasa)
 
 /* ------------------------------------------------------------------ */
@@ -423,7 +423,7 @@ static int NearestNode(CVector p, bool boat, int* outR = NULL, int* outI = NULL)
             if(d < bestD) { bestD = d; best = s_base[r] + i; if(outR) *outR = r; if(outI) *outI = i; }
         }
     }
-    return (bestD < 600.0f * 600.0f) ? best : -1;
+    return (bestD < 4000.0f * 4000.0f) ? best : -1;
 }
 
 static void IdToNode(int id, int& r, int& i)
@@ -542,35 +542,29 @@ static int CountMissingRegions(float minX, float maxX, float minY, float maxY, f
 
 static void RequestNodesFor(CVector a, CVector b)
 {
+    (void)a; (void)b;
     if(!PathMakeRequest) return;
-    static unsigned s_tick = 0, s_lastReq = 0, s_lastForce = 0, s_noProgress = 0, s_forceLogs = 0;
-    static float s_last[4] = {0, 0, 0, 0};
+    static unsigned s_tick = 0, s_lastReq = 0, s_lastForce = 0, s_noProgress = 0, s_forceLogs = 0, s_idleUntil = 0;
     static bool s_reqActive = false;
     ++s_tick;
-    const float margin = 450.0f;
-    float minX = fminf(a.x, b.x) - margin, maxX = fmaxf(a.x, b.x) + margin;
-    float minY = fminf(a.y, b.y) - margin, maxY = fmaxf(a.y, b.y) + margin;
-    bool changed = fabsf(minX - s_last[0]) > 100 || fabsf(maxX - s_last[1]) > 100 || fabsf(minY - s_last[2]) > 100 || fabsf(maxY - s_last[3]) > 100;
-    if(changed || !s_reqActive || s_tick - s_lastReq > 240)
+    // Always ask for the whole map: a long route can leave the box between player and target
+    // (detours), and the node data of the whole world is only a few megabytes.
+    const float minX = -3000.0f, maxX = 3000.0f, minY = -3000.0f, maxY = 3000.0f;
+    if(!s_reqActive || s_tick - s_lastReq > 240)
     {
         PathMakeRequest((uintptr_t)ThePaths, minX, maxX, minY, maxY);
-        s_last[0] = minX; s_last[1] = maxX; s_last[2] = minY; s_last[3] = maxY;
         s_lastReq = s_tick; s_reqActive = true;
-        if(g_routeLogs < 40)
-            Dbg("STREAM request x=[%.0f..%.0f] y=[%.0f..%.0f] mapMode=%d loaded=0x%llx | stored: active=%d x=[%.0f..%.0f] y=[%.0f..%.0f]",
-                minX, maxX, minY, maxY, (int)g_mapMode, (unsigned long long)LoadedSignature(),
+        if(g_routeLogs < 40 || s_forceLogs < 5)
+            Dbg("STREAM request whole map, mapMode=%d loaded=0x%llx | stored: active=%d x=[%.0f..%.0f] y=[%.0f..%.0f]",
+                (int)g_mapMode, (unsigned long long)LoadedSignature(),
                 (int)At<bool>(ThePaths, 19600), At<float>(ThePaths, 19604), At<float>(ThePaths, 19608), At<float>(ThePaths, 19612), At<float>(ThePaths, 19616));
     }
-
     if(!g_mapMode && (s_tick % 300) == 1)
-    {
-        float cx0 = 0, cy0 = 0;
-        Dbg("STREAM in-game: loaded=0x%llx missing in route rect=%d", (unsigned long long)LoadedSignature(), CountMissingRegions(minX, maxX, minY, maxY, &cx0, &cy0));
-    }
+        Dbg("STREAM in-game: loaded=0x%llx (%d regions)", (unsigned long long)LoadedSignature(), __builtin_popcountll(LoadedSignature()));
 
     // On the pause map the game loop does not run its own streaming, so load the missing regions by hand:
-    // ask for them (UpdateStreaming / LoadScene only queue the requests) and then run the queue synchronously.
-    if(g_mapMode && bPauseForceLoad && StreamLoadAll && s_tick - s_lastForce > 6)
+    // UpdateStreaming only queues the requests, LoadAllRequestedModels runs the queue synchronously.
+    if(g_mapMode && bPauseForceLoad && StreamLoadAll && PathUpdateStreaming && s_tick >= s_idleUntil && s_tick - s_lastForce > 3)
     {
         float cx = 0, cy = 0;
         int missing = CountMissingRegions(minX, maxX, minY, maxY, &cx, &cy);
@@ -578,20 +572,18 @@ static void RequestNodesFor(CVector a, CVector b)
         {
             s_lastForce = s_tick;
             uint64_t before = LoadedSignature();
-            const char* how;
-            switch(s_noProgress % 3)
-            {
-                case 0:  how = "UpdateStreaming(false)+LoadAll"; if(PathUpdateStreaming) PathUpdateStreaming((uintptr_t)ThePaths, false); break;
-                case 1:  how = "UpdateStreaming(true)+LoadAll";  if(PathUpdateStreaming) PathUpdateStreaming((uintptr_t)ThePaths, true);  break;
-                default: how = "LoadScene+LoadAll";              if(PathLoadScene) { CVector c = {cx, cy, 0.0f}; PathLoadScene((uintptr_t)ThePaths, c); } break;
-            }
+            PathUpdateStreaming((uintptr_t)ThePaths, false);
             StreamLoadAll(false);
             uint64_t after = LoadedSignature();
-            if(after == before) ++s_noProgress; else s_noProgress = 0;
+            if(after == before)
+            {
+                if(++s_noProgress >= 3) { s_idleUntil = s_tick + 1500; s_noProgress = 0; } // the rest has no node data (sea), stop pushing
+            }
+            else s_noProgress = 0;
             if(s_forceLogs < 80)
             {
                 ++s_forceLogs;
-                Dbg("STREAM force via %s (centre %.0f %.0f): missing=%d, loaded 0x%llx -> 0x%llx", how, cx, cy, missing, (unsigned long long)before, (unsigned long long)after);
+                Dbg("STREAM force: missing=%d, loaded 0x%llx -> 0x%llx (%d regions)", missing, (unsigned long long)before, (unsigned long long)after, __builtin_popcountll(after));
             }
         }
     }
@@ -661,6 +653,17 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
         good = rc.n;
         if(dist) *dist = rc.len;
         gpsDistance = dist ? *dist : gpsDistance;
+        // connect the ends: player -> first node and last node -> target (drawing only, the cache stays untouched)
+        static CVector2D s_draw[MAX_NODE_POINTS + 2];
+        int m = 0;
+        float d0 = sqrtf((rc.pts[0].x - from.x) * (rc.pts[0].x - from.x) + (rc.pts[0].y - from.y) * (rc.pts[0].y - from.y));
+        float d1 = sqrtf((rc.pts[rc.n - 1].x - to.x) * (rc.pts[rc.n - 1].x - to.x) + (rc.pts[rc.n - 1].y - to.y) * (rc.pts[rc.n - 1].y - to.y));
+        if(d0 > 15.0f && d0 < 1500.0f) { s_draw[m].x = from.x; s_draw[m].y = from.y; ++m; }
+        int cnt = rc.n < MAX_NODE_POINTS ? rc.n : MAX_NODE_POINTS;
+        for(int i = 0; i < cnt; ++i) s_draw[m++] = rc.pts[i];
+        if(d1 > 15.0f && d1 < 1500.0f) { s_draw[m].x = to.x; s_draw[m].y = to.y; ++m; }
+        pts = s_draw;
+        good = m;
     }
     else
     {
