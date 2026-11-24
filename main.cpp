@@ -416,14 +416,29 @@ DECL_HOOKv(DrawRadarHook)
         Dbg("f=%u paused=%d radarVis=%d widget=%p menuBlip=%d player=%p veh=%p pedFlags=0x%x baseType=%d type=%d",
             g_frame, (int)IsGamePaused(), (int)IsRadarVisible(), aWidgets[WIDGET_RADAR], At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP),
             pl, vh, pl ? At<uint32_t>(pl, OFF_PED_FLAGS) : 0, vh ? At<int>(vh, OFF_VEH_BASETYPE) : -1, vh ? At<int>(vh, OFF_VEH_TYPE) : -1);
+        int mb = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
+        if(mb != 0 && mb != -1 && (mb & 0xFFFF) < MAX_RADAR_TRACES)
+        {
+            uint8_t* t = TraceAt(mb & 0xFFFF);
+            CVector tp = At<CVector>(t, OFF_TR_POS);
+            Dbg("  blip: idx=%d refInTrace=%u refInHandle=%u pos=(%.1f %.1f %.1f) sprite=%d colour=%u",
+                mb & 0xFFFF, (unsigned)At<uint16_t>(t, OFF_TR_REFINDEX), (unsigned)((uint32_t)mb >> 16), tp.x, tp.y, tp.z,
+                (int)At<int8_t>(t, OFF_TR_SPRITE), (unsigned)At<uint32_t>(t, OFF_TR_COLOUR));
+        }
     }
-    if(IsGamePaused() || !IsRadarVisible()) return; // pause-map drawing is not ported yet
+    if(IsGamePaused()) return; // pause-map drawing is not ported yet (radar-visible check dropped: widget slot is NULL in 2.10)
 
     // Player-set map waypoint
     int menuBlip = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
     int idx = menuBlip & 0xFFFF;
-    if(menuBlip != 0 && menuBlip != -1 && idx < MAX_RADAR_TRACES &&
-       At<uint16_t>(TraceAt(idx), OFF_TR_REFINDEX) == (uint16_t)((uint32_t)menuBlip >> 16))
+    bool blipOk = false;
+    if(menuBlip != 0 && menuBlip != -1 && idx < MAX_RADAR_TRACES)
+    {
+        CVector tp = At<CVector>(TraceAt(idx), OFF_TR_POS);
+        bool refOk = At<uint16_t>(TraceAt(idx), OFF_TR_REFINDEX) == (uint16_t)((uint32_t)menuBlip >> 16);
+        blipOk = refOk || tp.x != 0.0f || tp.y != 0.0f; // accept if the trace has a position even if the ref index differs
+    }
+    if(blipOk)
     {
         if(g_targetBlip != menuBlip)
         {
