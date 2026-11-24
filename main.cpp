@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <float.h>
 #include <stdarg.h>
+#include <string.h>
 
 #define MAX_NODE_POINTS 2000
 #define MAX_RADAR_TRACES 250
@@ -176,7 +177,15 @@ static void Dbg(const char* fmt, ...)
 {
     if(!g_dbg)
     {
-        g_dbg = fopen("/storage/emulated/0/Android/data/com.rockstargames.gtasa/files/gps_debug.txt", "w");
+        // The path comes from AML, so it is right for clones / dual space as well.
+        char path[512];
+        const char* root = aml->GetAndroidDataPath();
+        if(root && *root)
+            snprintf(path, sizeof(path), "%s%sgps_debug.txt", root, root[strlen(root) - 1] == '/' ? "" : "/");
+        else
+            snprintf(path, sizeof(path), "/storage/emulated/0/Android/data/com.rockstargames.gtasa/files/gps_debug.txt");
+        g_dbg = fopen(path, "w");
+        logger->Info("GPS: debug log -> %s (%s)", path, g_dbg ? "ok" : "cannot open");
         if(!g_dbg) return;
     }
     va_list a; va_start(a, fmt); vfprintf(g_dbg, fmt, a); va_end(a);
