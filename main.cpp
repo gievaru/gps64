@@ -23,6 +23,9 @@
 #include <float.h>
 #include <stdarg.h>
 #include <string.h>
+#include <vector>
+#include <queue>
+#include <algorithm>
 
 #define MAX_NODE_POINTS 2000
 #define MAX_RADAR_TRACES 250
@@ -58,6 +61,13 @@ template<typename T> static inline T& At(void* base, size_t off) { return *(T*)(
 #define SIZEOF_PATHNODE         40
 #define OFF_NODE_X              16   // int16, /8.0f
 #define OFF_NODE_Y              18   // int16, /8.0f
+// CPathFind extra tables (72 entries each, only the first 64 are outdoor regions)
+#define PATH_REGIONS            64
+#define OFF_PATHS_ADJ           5256 // CNodeAddress* pAdjacentNodes[region]
+#define OFF_PATHS_NUMNODES      8136 // int NumNodes[region]
+#define OFF_PATHS_NUMCAR        8424 // int NumNodesCarNodes[region] (car nodes come first)
+#define OFF_NODE_ADJIDX         24   // int16 index into pAdjacentNodes[region]
+#define OFF_NODE_FLAGS          32   // low nibble = number of adjacent nodes, bit5 = switched off, bit7 = water node
 // RsGlobal
 #define OFF_RS_WIDTH            8
 #define OFF_RS_HEIGHT           12
@@ -153,6 +163,13 @@ void (*LimitRadarPoint)(CVector2D& in);
 void (*RwRenderStateSet)(int, void*);
 void (*RwIm2DRenderPrimitive)(int, RwOpenGLVertex*, int);
 void (*SetScissorRect)(CRect&);
+// Path-node streaming (members of CPathFind: first argument is the ThePaths object)
+void (*PathMakeRequest)(uintptr_t, float, float, float, float);   // minX, maxX, minY, maxY
+void (*PathUpdateStreaming)(uintptr_t, bool);
+void (*PathReleaseRequested)(uintptr_t);
+int  (*PathFindRegion)(uintptr_t, float, float);
+bool bLongRoutes = true, bPauseForceLoad = true;
+unsigned g_routeLogs = 0;
 void (*ClearRadarBlip)(int);
 bool (*IsOnAMission)();
 void* (*GetPoolPed)(int);
@@ -341,56 +358,316 @@ static void DrawDistanceText()
     RenderFontBuffer();
 }
 
+/* ------------------------------------------------------------------ */
+/* Own route search over the game's path-node data                    */
+/* ------------------------------------------------------------------ */
+static inline uint8_t*       RegionNodes(int r)  { return At<uint8_t*>(ThePaths, OFF_PATHS_NODES + 8 * r); }
+static inline int            RegionCount(int r)  { return At<int>(ThePaths, OFF_PATHS_NUMNODES + 4 * r); }
+static inline int            RegionCars(int r)   { return At<int>(ThePaths, OFF_PATHS_NUMCAR + 4 * r); }
+static inline CNodeAddress*  RegionAdj(int r)    { return At<CNodeAddress*>(ThePaths, OFF_PATHS_ADJ + 8 * r); }
+static inline uint8_t*       NodeAt(int r, int i){ return RegionNodes(r) + SIZEOF_PATHNODE * i; }
+static inline CVector NodePos3(uint8_t* n)
+{
+    return { At<int16_t>(n, OFF_NODE_X) / 8.0f, At<int16_t>(n, OFF_NODE_Y) / 8.0f, At<int16_t>(n, 20) / 8.0f };
+}
+static inline bool NodeUsable(uint8_t* n, bool boat)
+{
+    uint8_t f = At<uint8_t>(n, OFF_NODE_FLAGS);
+    if(f & (1 << 5)) return false;                 // switched off
+    bool water = (f >> 7) & 1;
+    return boat ? water : !water;
+}
+
+struct RouteCache
+{
+    int startId = -1, goalId = -1;
+    uint64_t sig = 0;
+    bool boat = false, ok = false, valid = false;
+    int n = 0;
+    float len = 0.0f;
+    CVector2D pts[MAX_NODE_POINTS];
+};
+static RouteCache g_routeCache[2];
+
+static std::vector<int>   s_base(PATH_REGIONS + 1);
+static std::vector<float> s_g;
+static std::vector<int>   s_parent;
+static std::vector<uint8_t> s_closed;
+
+static uint64_t LoadedSignature()
+{
+    uint64_t sig = 0;
+    for(int r = 0; r < PATH_REGIONS; ++r) if(RegionNodes(r)) sig |= (1ULL << r);
+    return sig;
+}
+
+// Finds the nearest usable car node among all loaded regions. Returns a global id or -1.
+static int NearestNode(CVector p, bool boat, int* outR = NULL, int* outI = NULL)
+{
+    int best = -1; float bestD = 1e30f;
+    for(int r = 0; r < PATH_REGIONS; ++r)
+    {
+        if(!RegionNodes(r)) continue;
+        int cars = RegionCars(r), total = RegionCount(r);
+        if(cars <= 0 || cars > total || total > 20000) continue;
+        for(int i = 0; i < cars; ++i)
+        {
+            uint8_t* n = NodeAt(r, i);
+            if(!NodeUsable(n, boat)) continue;
+            CVector q = NodePos3(n);
+            float dx = q.x - p.x, dy = q.y - p.y, dz = (q.z - p.z) * 2.0f;
+            float d = dx * dx + dy * dy + dz * dz;
+            if(d < bestD) { bestD = d; best = s_base[r] + i; if(outR) *outR = r; if(outI) *outI = i; }
+        }
+    }
+    return (bestD < 600.0f * 600.0f) ? best : -1;
+}
+
+static void IdToNode(int id, int& r, int& i)
+{
+    r = 0;
+    while(r + 1 < PATH_REGIONS && s_base[r + 1] <= id) ++r;
+    i = id - s_base[r];
+}
+
+// A* over the loaded car nodes. Fills cache.pts (world X/Y) and cache.len.
+static bool AStarRoute(CVector from, CVector to, bool boat, RouteCache& rc)
+{
+    int total = 0;
+    for(int r = 0; r < PATH_REGIONS; ++r)
+    {
+        s_base[r] = total;
+        if(RegionNodes(r)) { int c = RegionCars(r); if(c > 0 && c <= RegionCount(r) && c <= 20000) total += c; }
+    }
+    s_base[PATH_REGIONS] = total;
+    if(total <= 0) return false;
+
+    int sr = 0, si = 0, gr = 0, gi = 0;
+    int startId = NearestNode(from, boat, &sr, &si);
+    int goalId  = NearestNode(to, boat, &gr, &gi);
+    if(startId < 0 || goalId < 0) return false;
+
+    s_g.assign(total, 1e30f);
+    s_parent.assign(total, -1);
+    s_closed.assign(total, 0);
+
+    CVector goalPos = NodePos3(NodeAt(gr, gi));
+    typedef std::pair<float, int> QE;
+    std::priority_queue<QE, std::vector<QE>, std::greater<QE> > open;
+    s_g[startId] = 0.0f;
+    { CVector sp = NodePos3(NodeAt(sr, si)); float h = sqrtf((sp.x-goalPos.x)*(sp.x-goalPos.x) + (sp.y-goalPos.y)*(sp.y-goalPos.y)); open.push(QE(h, startId)); }
+
+    bool found = false;
+    while(!open.empty())
+    {
+        int cur = open.top().second; open.pop();
+        if(s_closed[cur]) continue;
+        s_closed[cur] = 1;
+        if(cur == goalId) { found = true; break; }
+
+        int r, i; IdToNode(cur, r, i);
+        uint8_t* n = NodeAt(r, i);
+        CVector cp = NodePos3(n);
+        CNodeAddress* adj = RegionAdj(r);
+        if(!adj) continue;
+        int first = At<int16_t>(n, OFF_NODE_ADJIDX);
+        int cnt = At<uint8_t>(n, OFF_NODE_FLAGS) & 0xF;
+        if(first < 0) continue;
+        for(int k = 0; k < cnt; ++k)
+        {
+            CNodeAddress a = adj[first + k];
+            if(a.region >= PATH_REGIONS || !RegionNodes(a.region)) continue;
+            if((int)a.index >= RegionCars(a.region) || (int)a.index >= RegionCount(a.region)) continue;
+            uint8_t* nb = NodeAt(a.region, a.index);
+            if(!NodeUsable(nb, boat)) continue;
+            int nid = s_base[a.region] + a.index;
+            if(s_closed[nid]) continue;
+            CVector np = NodePos3(nb);
+            float dx = np.x - cp.x, dy = np.y - cp.y, dz = np.z - cp.z;
+            float ng = s_g[cur] + sqrtf(dx * dx + dy * dy + dz * dz);
+            if(ng < s_g[nid])
+            {
+                s_g[nid] = ng; s_parent[nid] = cur;
+                float hx = np.x - goalPos.x, hy = np.y - goalPos.y;
+                open.push(QE(ng + sqrtf(hx * hx + hy * hy), nid));
+            }
+        }
+    }
+    if(!found) return false;
+
+    // rebuild the path (goal -> start) and reverse it
+    static std::vector<int> rev; rev.clear();
+    for(int c = goalId; c != -1 && (int)rev.size() < 100000; c = s_parent[c]) rev.push_back(c);
+    int n = (int)rev.size();
+    if(n < 2) return false;
+    int step = n > MAX_NODE_POINTS ? (n + MAX_NODE_POINTS - 1) / MAX_NODE_POINTS : 1; // thin out absurdly long routes
+    int out = 0;
+    for(int k = n - 1; k >= 0 && out < MAX_NODE_POINTS; k -= step)
+    {
+        int r, i; IdToNode(rev[k], r, i);
+        CVector q = NodePos3(NodeAt(r, i));
+        rc.pts[out].x = q.x; rc.pts[out].y = q.y; ++out;
+    }
+    rc.n = out;
+    rc.len = s_g[goalId];
+    rc.startId = startId; rc.goalId = goalId;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Asking the game to keep the needed path-node regions loaded        */
+/* ------------------------------------------------------------------ */
+static void RequestNodesFor(CVector a, CVector b)
+{
+    if(!PathMakeRequest) return;
+    static unsigned s_tick = 0, s_lastReq = 0, s_lastForce = 0;
+    static float s_last[4] = {0, 0, 0, 0};
+    static bool s_reqActive = false;
+    ++s_tick;
+    const float margin = 450.0f;
+    float minX = fminf(a.x, b.x) - margin, maxX = fmaxf(a.x, b.x) + margin;
+    float minY = fminf(a.y, b.y) - margin, maxY = fmaxf(a.y, b.y) + margin;
+    bool changed = fabsf(minX - s_last[0]) > 100 || fabsf(maxX - s_last[1]) > 100 || fabsf(minY - s_last[2]) > 100 || fabsf(maxY - s_last[3]) > 100;
+    if(changed || !s_reqActive || s_tick - s_lastReq > 240)
+    {
+        PathMakeRequest((uintptr_t)ThePaths, minX, maxX, minY, maxY);
+        s_last[0] = minX; s_last[1] = maxX; s_last[2] = minY; s_last[3] = maxY;
+        s_lastReq = s_tick; s_reqActive = true;
+        if(g_routeLogs < 40) Dbg("STREAM request x=[%.0f..%.0f] y=[%.0f..%.0f] mapMode=%d loadedMask=0x%llx", minX, maxX, minY, maxY, (int)g_mapMode, (unsigned long long)LoadedSignature());
+    }
+    // On the pause map the game loop does not run its own streaming, so push it by hand when regions are missing.
+    if(g_mapMode && bPauseForceLoad && PathUpdateStreaming && PathFindRegion && s_tick - s_lastForce > 20)
+    {
+        int missing = 0;
+        for(int iy = 0; iy < 8; ++iy) for(int ix = 0; ix < 8; ++ix)
+        {
+            float cx = -3000.0f + 750.0f * (ix + 0.5f), cy = -3000.0f + 750.0f * (iy + 0.5f);
+            if(cx + 375 < minX || cx - 375 > maxX || cy + 375 < minY || cy - 375 > maxY) continue;
+            int r = PathFindRegion((uintptr_t)ThePaths, cx, cy);
+            if(r >= 0 && r < PATH_REGIONS && !RegionNodes(r)) ++missing;
+        }
+        if(missing > 0)
+        {
+            s_lastForce = s_tick;
+            PathUpdateStreaming((uintptr_t)ThePaths, true);
+            if(g_routeLogs < 40) Dbg("STREAM forced update, %d region(s) were missing, loadedMask now 0x%llx", missing, (unsigned long long)LoadedSignature());
+        }
+    }
+}
+
 static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float* dist = NULL)
 {
     void* player = FindPlayerPed(-1);
     void* veh = GetSupportedVehicle(player);
     if(!veh) { if(g_logNow) Dbg("DoPathDraw: no supported vehicle (player=%p)", player); return; }
 
-    short nodesCount = 0;
-    float trashVar;
+    CVector from = GetEntityPos(player);
     bool isBoat = VehIs(veh, VEH_BOAT);
-    CNodeAddress invalid = {0xFFFF, 0xFFFF};
+    bool boatNavi = isBoat && bAllowBoat;
+    RouteCache& rc = g_routeCache[isTargetBlip ? 0 : 1];
+    float trashVar;
 
-    DoPathSearch((uintptr_t)ThePaths, false, GetEntityPos(player), invalid, to, resultNodes, &nodesCount,
-                 MAX_NODE_POINTS, dist ? dist : &trashVar, 1000000.0f, NULL, 1000000.0f, false,
-                 invalid, false, isBoat && bAllowBoat);
+    if(bLongRoutes) RequestNodesFor(from, to);
+
+    // 1) our own search (no node limits, works over every loaded region)
+    bool haveRoute = false;
+    if(bLongRoutes)
+    {
+        uint64_t sig = LoadedSignature();
+        int sId = -2, gId = -2;
+        {
+            // cheap check whether the cached result can still be used: same loaded regions, start and goal still map to the same nodes
+            int total = 0;
+            for(int r = 0; r < PATH_REGIONS; ++r) { s_base[r] = total; if(RegionNodes(r)) { int c = RegionCars(r); if(c > 0 && c <= RegionCount(r) && c <= 20000) total += c; } }
+            s_base[PATH_REGIONS] = total;
+            sId = NearestNode(from, boatNavi);
+            gId = NearestNode(to, boatNavi);
+        }
+        if(rc.valid && rc.sig == sig && rc.startId == sId && rc.goalId == gId && rc.boat == boatNavi)
+        {
+            haveRoute = rc.ok;
+        }
+        else
+        {
+            unsigned t0 = 0; (void)t0;
+            bool ok = AStarRoute(from, to, boatNavi, rc);
+            rc.valid = true; rc.sig = sig; rc.boat = boatNavi; rc.ok = ok;
+            if(!ok) { rc.startId = sId; rc.goalId = gId; }
+            haveRoute = ok;
+
+            if(g_routeLogs < 40)
+            {
+                ++g_routeLogs;
+                // compare with the game's own search, for the log only
+                short gn = 0; float gd = 0;
+                CNodeAddress inv = {0xFFFF, 0xFFFF};
+                DoPathSearch((uintptr_t)ThePaths, false, from, inv, to, resultNodes, &gn, MAX_NODE_POINTS, &gd, 1000000.0f, NULL, 1000000.0f, false, inv, false, boatNavi);
+                float straight = sqrtf((from.x - to.x) * (from.x - to.x) + (from.y - to.y) * (from.y - to.y));
+                Dbg("ROUTE#%u mapMode=%d straight=%.0f | own: ok=%d nodes=%d len=%.0f | game: nodes=%d dist=%.0f | loadedRegions=%d",
+                    g_routeLogs, (int)g_mapMode, straight, (int)ok, ok ? rc.n : 0, ok ? rc.len : 0.0f, (int)gn, gd, __builtin_popcountll(sig));
+            }
+        }
+    }
+
+    // 2) fall back to the game's own search
+    short nodesCount = 0;
+    CVector2D* pts = rc.pts;
+    int good = 0;
+    if(haveRoute)
+    {
+        nodesCount = (short)rc.n;
+        good = rc.n;
+        if(dist) *dist = rc.len;
+        gpsDistance = dist ? *dist : gpsDistance;
+    }
+    else
+    {
+        CNodeAddress invalid = {0xFFFF, 0xFFFF};
+        DoPathSearch((uintptr_t)ThePaths, false, from, invalid, to, resultNodes, &nodesCount,
+                     MAX_NODE_POINTS, dist ? dist : &trashVar, 1000000.0f, NULL, 1000000.0f, false,
+                     invalid, false, boatNavi);
+        for(short i = 0; i < nodesCount; ++i)
+        {
+            uint8_t* table = At<uint8_t*>(ThePaths, OFF_PATHS_NODES + 8 * resultNodes[i].region);
+            if(!table) continue;
+            uint8_t* node = table + SIZEOF_PATHNODE * resultNodes[i].index;
+            pts[good].x = At<int16_t>(node, OFF_NODE_X) / 8.0f;
+            pts[good].y = At<int16_t>(node, OFF_NODE_Y) / 8.0f;
+            ++good;
+        }
+    }
 
     static unsigned s_calls = 0;
     static int s_lastNodes = -2;
     ++s_calls;
-    if(s_calls <= 20 || (s_calls % 120) == 0 || nodesCount != s_lastNodes)
-        Dbg("DoPathDraw#%u: DoPathSearch nodes=%d dist=%.1f player=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)", s_calls, (int)nodesCount,
-            dist ? *dist : trashVar, GetEntityPos(player).x, GetEntityPos(player).y, GetEntityPos(player).z, to.x, to.y, to.z);
+    if(s_calls <= 10 || (s_calls % 240) == 0 || nodesCount != s_lastNodes)
+        Dbg("DoPathDraw#%u: %s nodes=%d dist=%.1f player=(%.1f %.1f) target=(%.1f %.1f)", s_calls, haveRoute ? "own" : "game", (int)nodesCount,
+            dist ? *dist : trashVar, from.x, from.y, to.x, to.y);
     s_lastNodes = nodesCount;
-    if(nodesCount <= 0) return;
+    if(nodesCount <= 0 || good <= 0) return;
 
     if(isTargetBlip && !g_mapMode && gpsDistance < pCfgClosestMaxGPSDistance->GetFloat())
     {
         ClearRadarBlip(g_targetBlip);
         At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP) = 0;
         g_targetBlip = 0;
+        if(PathReleaseRequested && bLongRoutes) PathReleaseRequested((uintptr_t)ThePaths);
         return;
     }
 
-    short good = 0;
-    for(short i = 0; i < nodesCount; ++i)
+    for(int i = 0; i < good; ++i)
     {
-        uint8_t* table = At<uint8_t*>(ThePaths, OFF_PATHS_NODES + 8 * resultNodes[i].region);
-        if(!table) continue;
-        uint8_t* node = table + SIZEOF_PATHNODE * resultNodes[i].index;
-        CVector2D nodePos = { At<int16_t>(node, OFF_NODE_X) / 8.0f, At<int16_t>(node, OFF_NODE_Y) / 8.0f };
+        CVector2D nodePos = pts[i];
         if(g_mapMode)
         {
             CVector2D rp;
             TransformRealWorldPointToRadarSpace(rp, nodePos);
             LimitRadarPoint(rp);
-            TransformRadarPointToScreenSpace(radarPts[good], rp);
-            radarPts[good].x *= mapScale;
-            radarPts[good].y *= mapScale;
+            TransformRadarPointToScreenSpace(radarPts[i], rp);
+            radarPts[i].x *= mapScale;
+            radarPts[i].y *= mapScale;
         }
-        else TransformRealWorldPointToRadarSpace(radarPts[good], nodePos);
-        ++good;
+        else TransformRealWorldPointToRadarSpace(radarPts[i], nodePos);
     }
     if(g_logNow) Dbg("DoPathDraw: good nodes=%d", (int)good);
     if(g_mapMode)
@@ -663,6 +940,8 @@ extern "C" void OnModLoad()
     pCfgGPSDrawDistancePosition = cfg->Bind("GPSDrawDistancePos", 0); // 0 under, 1 above, 2 left, 3 right, 4 custom
     pCfgGPSDrawDistanceTextScale = cfg->Bind("GPSDrawDistanceTextScale", 1.0f);
     pCfgGPSDrawDistanceTextOffset = cfg->Bind("GPSDrawDistanceTextOffset", "0.0 0.0");
+    bLongRoutes = cfg->Bind("LongRoutes", true)->GetBool();            // own route search + path-node streaming
+    bPauseForceLoad = cfg->Bind("PauseMapForceLoad", true)->GetBool(); // push node streaming by hand on the pause map
     bAllowBMX = cfg->Bind("AllowBMX", false)->GetBool();
     bAllowBoat = cfg->Bind("AllowBoatNavi", true)->GetBool();
     bAllowMission = cfg->Bind("MissionRoutes", true)->GetBool();
@@ -722,6 +1001,12 @@ extern "C" void OnModLoad()
     SET_TO(GetPoolVeh,                          Sym("_ZN6CPools10GetVehicleEi"));
     SET_TO(GetPoolObj,                          Sym("_ZN6CPools9GetObjectEi"));
 
+    // optional: path-node streaming (long routes)
+    PathMakeRequest      = (void(*)(uintptr_t, float, float, float, float))aml->GetSym(hGTASA, "_ZN9CPathFind29MakeRequestForNodesToBeLoadedEffff");
+    PathUpdateStreaming  = (void(*)(uintptr_t, bool))aml->GetSym(hGTASA, "_ZN9CPathFind15UpdateStreamingEb");
+    PathReleaseRequested = (void(*)(uintptr_t))aml->GetSym(hGTASA, "_ZN9CPathFind21ReleaseRequestedNodesEv");
+    PathFindRegion       = (int(*)(uintptr_t, float, float))aml->GetSym(hGTASA, "_ZN9CPathFind19FindRegionForCoorsEff");
+    Dbg("streaming api: make=%p update=%p release=%p region=%p", (void*)PathMakeRequest, (void*)PathUpdateStreaming, (void*)PathReleaseRequested, (void*)PathFindRegion);
     uintptr_t radarHud = Sym("_ZN4CHud9DrawRadarEv");
     uintptr_t gangOverlay = Sym("_ZN6CRadar20DrawRadarGangOverlayEb");
     if(g_missing)
