@@ -97,6 +97,7 @@ enum { BLIP_COLOUR_RED = 0, BLIP_COLOUR_GREEN, BLIP_COLOUR_BLUE, BLIP_COLOUR_WHI
 enum { ALIGN_CENTER = 0, ALIGN_LEFT = 1, ALIGN_RIGHT = 2 };
 #define FONT_SUBTITLES 1
 #define rwRENDERSTATETEXTURERASTER 1
+#define rwPRIMTYPETRILIST 3
 #define rwPRIMTYPETRISTRIP 4
 
 /* ------------------------------------------------------------------ */
@@ -107,7 +108,8 @@ void* hGTASA;
 
 CNodeAddress resultNodes[MAX_NODE_POINTS];
 CVector2D nodePoints[MAX_NODE_POINTS];
-RwOpenGLVertex lineVerts[MAX_NODE_POINTS * 4];
+RwOpenGLVertex lineVerts[MAX_NODE_POINTS * 6];
+CVector2D radarPts[MAX_NODE_POINTS];
 float gpsDistance;
 CVector2D gpsDistanceTextPos;
 CRect emptyRect = {0, 0, 0, 0}, radarRect;
@@ -375,76 +377,72 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
         if(!table) continue;
         uint8_t* node = table + SIZEOF_PATHNODE * resultNodes[i].index;
         CVector2D nodePos = { At<int16_t>(node, OFF_NODE_X) / 8.0f, At<int16_t>(node, OFF_NODE_Y) / 8.0f };
-        TransformRealWorldPointToRadarSpace(nodePos, nodePos);
-        TransformRadarPointToScreenSpace(nodePoints[good++], nodePos);
+        TransformRealWorldPointToRadarSpace(radarPts[good], nodePos);
+        ++good;
     }
     if(g_logNow) Dbg("DoPathDraw: good nodes=%d", (int)good);
     if(good < 2) return;
 
     if(!g_bTextInited) { g_bTextInited = true; SetDistanceTextValues(); }
-    SetScissorRect(radarRect);
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER, NULL);
 
-    unsigned int vertIndex = 0;
-    short segs = good - 1;
-    for(short i = 0; i < segs; i++)
+    // The scissor rect does not clip in 2.10, so every segment is clipped to the radar disc here
+    // (radar space: the disc has radius 1).
+    const float R = 0.97f;
+    unsigned int vi = 0;
+    for(short i = 0; i < good - 1; i++)
     {
-        CVector2D dir = { nodePoints[i + 1].x - nodePoints[i].x, nodePoints[i + 1].y - nodePoints[i].y };
-        float angle = atan2f(dir.y, dir.x);
-        CVector2D s0 = { cosf(angle - 1.5707963f) * lineWidth, sinf(angle - 1.5707963f) * lineWidth };
-        CVector2D s1 = { cosf(angle + 1.5707963f) * lineWidth, sinf(angle + 1.5707963f) * lineWidth };
-        Setup2DVertex(lineVerts[vertIndex++], nodePoints[i].x     + s0.x, nodePoints[i].y     + s0.y, color);
-        Setup2DVertex(lineVerts[vertIndex++], nodePoints[i + 1].x + s0.x, nodePoints[i + 1].y + s0.y, color);
-        Setup2DVertex(lineVerts[vertIndex++], nodePoints[i].x     + s1.x, nodePoints[i].y     + s1.y, color);
-        Setup2DVertex(lineVerts[vertIndex++], nodePoints[i + 1].x + s1.x, nodePoints[i + 1].y + s1.y, color);
+        CVector2D P0 = radarPts[i], P1 = radarPts[i + 1];
+        CVector2D d = { P1.x - P0.x, P1.y - P0.y };
+        float qa = d.x * d.x + d.y * d.y;
+        if(qa < 1e-9f) continue;
+        float qb = P0.x * d.x + P0.y * d.y;
+        float qc = P0.x * P0.x + P0.y * P0.y - R * R;
+        float disc = qb * qb - qa * qc;
+        if(disc <= 0.0f) continue;
+        float sq = sqrtf(disc);
+        float t0 = (-qb - sq) / qa, t1 = (-qb + sq) / qa;
+        if(t0 < 0.0f) t0 = 0.0f;
+        if(t1 > 1.0f) t1 = 1.0f;
+        if(t0 >= t1) continue;
+        CVector2D Q0 = { P0.x + d.x * t0, P0.y + d.y * t0 }, Q1 = { P0.x + d.x * t1, P0.y + d.y * t1 };
+        CVector2D S0, S1;
+        TransformRadarPointToScreenSpace(S0, Q0);
+        TransformRadarPointToScreenSpace(S1, Q1);
+        float angle = atan2f(S1.y - S0.y, S1.x - S0.x);
+        CVector2D o0 = { cosf(angle - 1.5707963f) * lineWidth, sinf(angle - 1.5707963f) * lineWidth };
+        CVector2D o1 = { cosf(angle + 1.5707963f) * lineWidth, sinf(angle + 1.5707963f) * lineWidth };
+        RwOpenGLVertex* v = &lineVerts[vi];
+        Setup2DVertex(v[0], S0.x + o0.x, S0.y + o0.y, color);
+        Setup2DVertex(v[1], S1.x + o0.x, S1.y + o0.y, color);
+        Setup2DVertex(v[2], S0.x + o1.x, S0.y + o1.y, color);
+        v[3] = v[1];
+        Setup2DVertex(v[4], S1.x + o1.x, S1.y + o1.y, color);
+        v[5] = v[2];
+        vi += 6;
     }
-    RwIm2DRenderPrimitive(rwPRIMTYPETRISTRIP, lineVerts, 4 * segs);
-    SetScissorRect(emptyRect);
+    for(unsigned int off = 0; off < vi; off += 600)
+    {
+        unsigned int n = vi - off < 600 ? vi - off : 600;
+        RwIm2DRenderPrimitive(rwPRIMTYPETRILIST, &lineVerts[off], (int)n);
+    }
+    if(g_logNow) Dbg("DoPathDraw: drew %u vertices", vi);
 }
 
-DECL_HOOKv(DrawRadarHook)
+static bool g_lineDone = false;
+
+static bool EnsureInit()
 {
-    DrawRadarHook();
-    ++g_frame;
-    g_logNow = (g_frame % 180) == 1;
-    if(g_frame == 1) Dbg("hook called for the first time");
+    if(g_bInited) return true;
+    if(At<int>(RsGlobal, OFF_RS_WIDTH) <= 0) return false;
+    g_bInited = true;
+    InitializeConfigValues();
+    return true;
+}
 
-    if(!g_bInited)
-    {
-        if(At<int>(RsGlobal, OFF_RS_WIDTH) <= 0) return;
-        g_bInited = true;
-        InitializeConfigValues();
-    }
-    gpsDistance = 0;
-    g_pMissionTrace = NULL;
-    if(g_logNow)
-    {
-        void* pl = FindPlayerPed(-1);
-        void* vh = pl ? At<void*>(pl, OFF_PED_VEHICLE) : NULL;
-        Dbg("f=%u paused=%d radarVis=%d widget=%p menuBlip=%d player=%p veh=%p pedFlags=0x%x baseType=%d type=%d",
-            g_frame, (int)IsGamePaused(), (int)IsRadarVisible(), aWidgets[WIDGET_RADAR], At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP),
-            pl, vh, pl ? At<uint32_t>(pl, OFF_PED_FLAGS) : 0, vh ? At<int>(vh, OFF_VEH_BASETYPE) : -1, vh ? At<int>(vh, OFF_VEH_TYPE) : -1);
-        int mb = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
-        if(mb != 0 && mb != -1 && (mb & 0xFFFF) < MAX_RADAR_TRACES)
-        {
-            uint8_t* t = TraceAt(mb & 0xFFFF);
-            CVector tp = At<CVector>(t, OFF_TR_POS);
-            Dbg("  blip: idx=%d refInTrace=%u refInHandle=%u pos=(%.1f %.1f %.1f) sprite=%d colour=%u",
-                mb & 0xFFFF, (unsigned)At<uint16_t>(t, OFF_TR_REFINDEX), (unsigned)((uint32_t)mb >> 16), tp.x, tp.y, tp.z,
-                (int)At<int8_t>(t, OFF_TR_SPRITE), (unsigned)At<uint32_t>(t, OFF_TR_COLOUR));
-        }
-    }
-    {
-        static int s_lastMenuBlip = 0;
-        int mb2 = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
-        if(mb2 != s_lastMenuBlip)
-        {
-            s_lastMenuBlip = mb2;
-            Dbg("f=%u menuBlip changed -> %d (idx %d, ref %d) paused=%d", g_frame, mb2, mb2 & 0xFFFF, (int)((uint32_t)mb2 >> 16), (int)IsGamePaused());
-        }
-    }
-    if(IsGamePaused()) return; // pause-map drawing is not ported yet (radar-visible check dropped: widget slot is NULL in 2.10)
-
+static void DoGpsFrame()
+{
+    if(IsGamePaused()) return; // pause-map drawing is not ported yet
     // Player-set map waypoint
     int menuBlip = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
     int idx = menuBlip & 0xFFFF;
@@ -528,6 +526,58 @@ DECL_HOOKv(DrawRadarHook)
         }
     }
 
+}
+
+// Drawn from inside the radar drawing (after the map), like the original mod did.
+DECL_HOOKv(DrawRadarGangHook, bool b)
+{
+    DrawRadarGangHook(b);
+    if(g_lineDone || !EnsureInit()) return;
+    g_lineDone = true;
+    DoGpsFrame();
+}
+
+DECL_HOOKv(DrawRadarHook)
+{
+    g_lineDone = false;
+    gpsDistance = 0;
+    g_pMissionTrace = NULL;
+    DrawRadarHook();
+    ++g_frame;
+    g_logNow = (g_frame % 180) == 1;
+    if(g_frame == 1) Dbg("hook called for the first time");
+
+    if(!EnsureInit()) return;
+    if(g_logNow)
+    {
+        void* pl = FindPlayerPed(-1);
+        void* vh = pl ? At<void*>(pl, OFF_PED_VEHICLE) : NULL;
+        Dbg("f=%u paused=%d radarVis=%d widget=%p menuBlip=%d player=%p veh=%p pedFlags=0x%x baseType=%d type=%d",
+            g_frame, (int)IsGamePaused(), (int)IsRadarVisible(), aWidgets[WIDGET_RADAR], At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP),
+            pl, vh, pl ? At<uint32_t>(pl, OFF_PED_FLAGS) : 0, vh ? At<int>(vh, OFF_VEH_BASETYPE) : -1, vh ? At<int>(vh, OFF_VEH_TYPE) : -1);
+        int mb = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
+        if(mb != 0 && mb != -1 && (mb & 0xFFFF) < MAX_RADAR_TRACES)
+        {
+            uint8_t* t = TraceAt(mb & 0xFFFF);
+            CVector tp = At<CVector>(t, OFF_TR_POS);
+            Dbg("  blip: idx=%d refInTrace=%u refInHandle=%u pos=(%.1f %.1f %.1f) sprite=%d colour=%u",
+                mb & 0xFFFF, (unsigned)At<uint16_t>(t, OFF_TR_REFINDEX), (unsigned)((uint32_t)mb >> 16), tp.x, tp.y, tp.z,
+                (int)At<int8_t>(t, OFF_TR_SPRITE), (unsigned)At<uint32_t>(t, OFF_TR_COLOUR));
+        }
+    }
+    {
+        static int s_lastMenuBlip = 0;
+        int mb2 = At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP);
+        if(mb2 != s_lastMenuBlip)
+        {
+            s_lastMenuBlip = mb2;
+            Dbg("f=%u menuBlip changed -> %d (idx %d, ref %d) paused=%d", g_frame, mb2, mb2 & 0xFFFF, (int)((uint32_t)mb2 >> 16), (int)IsGamePaused());
+        }
+    }
+    if(g_frame == 1 || g_logNow) Dbg("  line drawn from the gang-overlay hook this frame: %d", (int)g_lineDone);
+    if(IsGamePaused()) return; // pause-map drawing is not ported yet (radar-visible check dropped: widget slot is NULL in 2.10)
+
+    if(!g_lineDone) { g_lineDone = true; DoGpsFrame(); } // fallback if the gang-overlay hook did not run
     DrawDistanceText();
 }
 
@@ -618,6 +668,7 @@ extern "C" void OnModLoad()
     SET_TO(GetPoolObj,                          Sym("_ZN6CPools9GetObjectEi"));
 
     uintptr_t radarHud = Sym("_ZN4CHud9DrawRadarEv");
+    uintptr_t gangOverlay = Sym("_ZN6CRadar20DrawRadarGangOverlayEb");
     if(g_missing)
     {
         logger->Error("GPS: %d symbol(s) missing, the mod stays disabled", g_missing);
@@ -625,6 +676,7 @@ extern "C" void OnModLoad()
         return;
     }
     HOOK(DrawRadarHook, radarHud);
+    HOOK(DrawRadarGangHook, gangOverlay);
     Dbg("loaded: ThePaths=%p gMobileMenu=%p RsGlobal=%p trace=%p widgets=%p pickups=%p DoPathSearch=%p hook=%p",
         ThePaths, gMobileMenu, RsGlobal, pRadarTrace, aWidgets, aPickUps, (void*)DoPathSearch, (void*)radarHud);
 
