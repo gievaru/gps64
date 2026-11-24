@@ -38,8 +38,8 @@
 #define GPS_LINE_B      0
 #define GPS_LINE_A      255
 
-#define GPS_BUILD "r6"
-MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r6, DK22Pac & juicermv & RusJJ)
+#define GPS_BUILD "r7"
+MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r7, DK22Pac & juicermv & RusJJ)
 NEEDGAME(com.rockstargames.gtasa)
 
 /* ------------------------------------------------------------------ */
@@ -170,6 +170,7 @@ void (*PathUpdateStreaming)(uintptr_t, bool);
 void (*PathReleaseRequested)(uintptr_t);
 int  (*PathFindRegion)(uintptr_t, float, float);
 void (*PathLoadScene)(uintptr_t, CVector);
+void (*StreamLoadAll)(bool);   // CStreaming::LoadAllRequestedModels(bool): synchronous, works on the pause map
 bool bLongRoutes = true, bPauseForceLoad = true;
 unsigned g_routeLogs = 0;
 void (*ClearRadarBlip)(int);
@@ -567,8 +568,9 @@ static void RequestNodesFor(CVector a, CVector b)
         Dbg("STREAM in-game: loaded=0x%llx missing in route rect=%d", (unsigned long long)LoadedSignature(), CountMissingRegions(minX, maxX, minY, maxY, &cx0, &cy0));
     }
 
-    // On the pause map the game loop does not run its own streaming, so load the missing regions by hand.
-    if(g_mapMode && bPauseForceLoad && s_tick - s_lastForce > 8)
+    // On the pause map the game loop does not run its own streaming, so load the missing regions by hand:
+    // ask for them (UpdateStreaming / LoadScene only queue the requests) and then run the queue synchronously.
+    if(g_mapMode && bPauseForceLoad && StreamLoadAll && s_tick - s_lastForce > 6)
     {
         float cx = 0, cy = 0;
         int missing = CountMissingRegions(minX, maxX, minY, maxY, &cx, &cy);
@@ -576,15 +578,20 @@ static void RequestNodesFor(CVector a, CVector b)
         {
             s_lastForce = s_tick;
             uint64_t before = LoadedSignature();
-            const char* how = "none";
-            if(PathLoadScene && s_noProgress < 3) { CVector c = {cx, cy, 0.0f}; PathLoadScene((uintptr_t)ThePaths, c); how = "LoadScene"; }
-            else if(PathUpdateStreaming)            { PathUpdateStreaming((uintptr_t)ThePaths, true); how = "UpdateStreaming(true)"; s_noProgress = 0; }
+            const char* how;
+            switch(s_noProgress % 3)
+            {
+                case 0:  how = "UpdateStreaming(false)+LoadAll"; if(PathUpdateStreaming) PathUpdateStreaming((uintptr_t)ThePaths, false); break;
+                case 1:  how = "UpdateStreaming(true)+LoadAll";  if(PathUpdateStreaming) PathUpdateStreaming((uintptr_t)ThePaths, true);  break;
+                default: how = "LoadScene+LoadAll";              if(PathLoadScene) { CVector c = {cx, cy, 0.0f}; PathLoadScene((uintptr_t)ThePaths, c); } break;
+            }
+            StreamLoadAll(false);
             uint64_t after = LoadedSignature();
             if(after == before) ++s_noProgress; else s_noProgress = 0;
-            if(s_forceLogs < 60)
+            if(s_forceLogs < 80)
             {
                 ++s_forceLogs;
-                Dbg("STREAM force via %s at (%.0f %.0f): missing=%d, loaded 0x%llx -> 0x%llx", how, cx, cy, missing, (unsigned long long)before, (unsigned long long)after);
+                Dbg("STREAM force via %s (centre %.0f %.0f): missing=%d, loaded 0x%llx -> 0x%llx", how, cx, cy, missing, (unsigned long long)before, (unsigned long long)after);
             }
         }
     }
@@ -1043,6 +1050,16 @@ extern "C" void OnModLoad()
     PathReleaseRequested = (void(*)(uintptr_t))aml->GetSym(hGTASA, "_ZN9CPathFind21ReleaseRequestedNodesEv");
     PathFindRegion       = (int(*)(uintptr_t, float, float))aml->GetSym(hGTASA, "_ZN9CPathFind19FindRegionForCoorsEff");
     PathLoadScene        = (void(*)(uintptr_t, CVector))aml->GetSym(hGTASA, "_ZN9CPathFind21LoadSceneForPathNodesE7CVector");
+    StreamLoadAll = NULL;
+    if(pGTASA)
+    {
+        const uint32_t expect[4] = {0xa9ba6ffc, 0xa90167fa, 0xa9025ff8, 0xa90357f6};
+        const uint32_t* code = (const uint32_t*)(pGTASA + 0x396b28);
+        bool same = true;
+        for(int i = 0; i < 4; ++i) if(code[i] != expect[i]) same = false;
+        if(same) StreamLoadAll = (void(*)(bool))(pGTASA + 0x396b28);
+        Dbg("LoadAllRequestedModels at %p: %s", (void*)(pGTASA + 0x396b28), same ? "code matches the 2.10 arm64 build" : "CODE DOES NOT MATCH, disabled");
+    }
     Dbg("streaming api: make=%p update=%p release=%p loadScene=%p", (void*)PathMakeRequest, (void*)PathUpdateStreaming, (void*)PathReleaseRequested, (void*)PathLoadScene);
     uintptr_t radarHud = Sym("_ZN4CHud9DrawRadarEv");
     uintptr_t gangOverlay = Sym("_ZN6CRadar20DrawRadarGangOverlayEb");
