@@ -29,17 +29,18 @@
 
 #define MAX_NODE_POINTS 2000
 #define MAX_RADAR_TRACES 250
+#define SMOOTH_MAX 6000
 
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
 
-#define GPS_LINE_R      235
-#define GPS_LINE_G      212
-#define GPS_LINE_B      0
+#define GPS_LINE_R      207   // #CFB65C
+#define GPS_LINE_G      182
+#define GPS_LINE_B      92
 #define GPS_LINE_A      255
 
-#define GPS_BUILD "r9"
-MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r9, DK22Pac & juicermv & RusJJ)
+#define GPS_BUILD "r10"
+MYMODCFG(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r10, DK22Pac & juicermv & RusJJ)
 NEEDGAME(com.rockstargames.gtasa)
 
 /* ------------------------------------------------------------------ */
@@ -119,8 +120,7 @@ void* hGTASA;
 
 CNodeAddress resultNodes[MAX_NODE_POINTS];
 CVector2D nodePoints[MAX_NODE_POINTS];
-RwOpenGLVertex lineVerts[MAX_NODE_POINTS * 6];
-CVector2D radarPts[MAX_NODE_POINTS];
+RwOpenGLVertex lineVerts[SMOOTH_MAX * 6];
 float gpsDistance;
 CVector2D gpsDistanceTextPos;
 CRect emptyRect = {0, 0, 0, 0}, radarRect;
@@ -593,6 +593,90 @@ static void RequestNodesFor(CVector a, CVector b)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Smoothing and ribbon drawing                                       */
+/* ------------------------------------------------------------------ */
+static inline float Dist2D(const CVector2D& a, const CVector2D& b) { float dx = a.x - b.x, dy = a.y - b.y; return sqrtf(dx * dx + dy * dy); }
+static inline CVector2D Lerp2(const CVector2D& a, const CVector2D& b, float k) { return { a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k }; }
+
+// Rounds every corner of the node polyline (world X/Y) with a quadratic arc. Straight parts stay straight, and the
+// trim never exceeds half of a neighbouring segment, so on densely noded bends this turns into a smooth B-spline.
+static int SmoothRoute(const CVector2D* in, int n, CVector2D* out, int maxOut)
+{
+    static CVector2D s_clean[MAX_NODE_POINTS + 4];
+    int c = 0;
+    for(int i = 0; i < n && c < MAX_NODE_POINTS + 2; ++i)
+        if(c == 0 || Dist2D(s_clean[c - 1], in[i]) > 0.5f) s_clean[c++] = in[i];
+    int m = 0;
+    if(c < 3) { for(int i = 0; i < c && m < maxOut; ++i) out[m++] = s_clean[i]; return m; }
+
+    const float maxTrim = 12.0f;                 // metres: corner radius of a 90 degree turn
+    out[m++] = s_clean[0];
+    for(int i = 1; i < c - 1 && m < maxOut - 20; ++i)
+    {
+        CVector2D A = s_clean[i - 1], P = s_clean[i], B = s_clean[i + 1];
+        float la = Dist2D(A, P), lb = Dist2D(P, B);
+        CVector2D ua = { (P.x - A.x) / la, (P.y - A.y) / la }, ub = { (B.x - P.x) / lb, (B.y - P.y) / lb };
+        float cosT = ua.x * ub.x + ua.y * ub.y;
+        if(cosT > 0.9986f) { out[m++] = P; continue; }          // nearly straight (< 3 degrees): keep the node
+        float d = fminf(maxTrim, fminf(0.5f * la, 0.5f * lb));
+        CVector2D E = { P.x - ua.x * d, P.y - ua.y * d }, X = { P.x + ub.x * d, P.y + ub.y * d };
+        float theta = acosf(fmaxf(-1.0f, fminf(1.0f, cosT)));   // turning angle
+        int steps = (int)ceilf(theta / 0.26f);                  // ~15 degrees per step
+        if(steps < 2) steps = 2; else if(steps > 10) steps = 10;
+        for(int k = 0; k <= steps; ++k)
+        {
+            float t = (float)k / steps, u = 1.0f - t;
+            out[m].x = u * u * E.x + 2.0f * u * t * P.x + t * t * X.x;
+            out[m].y = u * u * E.y + 2.0f * u * t * P.y + t * t * X.y;
+            ++m;
+        }
+    }
+    out[m++] = s_clean[c - 1];
+    return m;
+}
+
+static unsigned g_lineVi = 0;
+
+// One continuous ribbon along the screen-space points: every joint gets a mitered offset, so there are no gaps or overlaps.
+static void AppendRibbon(const CVector2D* P, int n, RGBA col, float hw)
+{
+    if(n < 2) return;
+    static CVector2D L[SMOOTH_MAX], R[SMOOTH_MAX];
+    int cnt = n < SMOOTH_MAX ? n : SMOOTH_MAX;
+    for(int i = 0; i < cnt; ++i)
+    {
+        CVector2D dp = {0, 0}, dn = {0, 0};
+        if(i > 0)       { dp = { P[i].x - P[i - 1].x, P[i].y - P[i - 1].y }; float l = sqrtf(dp.x * dp.x + dp.y * dp.y); if(l > 1e-4f) { dp.x /= l; dp.y /= l; } else dp = {0, 0}; }
+        if(i < cnt - 1) { dn = { P[i + 1].x - P[i].x, P[i + 1].y - P[i].y }; float l = sqrtf(dn.x * dn.x + dn.y * dn.y); if(l > 1e-4f) { dn.x /= l; dn.y /= l; } else dn = {0, 0}; }
+        CVector2D seg = (dn.x != 0.0f || dn.y != 0.0f) ? dn : dp;
+        CVector2D t = { dp.x + dn.x, dp.y + dn.y };
+        float tl = sqrtf(t.x * t.x + t.y * t.y);
+        float nx, ny, scale = 1.0f;
+        if(tl < 1e-3f) { nx = -seg.y; ny = seg.x; }                // reversal or one-sided end: plain normal
+        else
+        {
+            t.x /= tl; t.y /= tl;
+            nx = -t.y; ny = t.x;
+            float c = nx * (-seg.y) + ny * seg.x;                   // cos of the half angle between the miter and the segment normal
+            scale = c > 0.5f ? 1.0f / c : 2.0f;                     // miter limit
+        }
+        L[i] = { P[i].x + nx * hw * scale, P[i].y + ny * hw * scale };
+        R[i] = { P[i].x - nx * hw * scale, P[i].y - ny * hw * scale };
+    }
+    for(int i = 0; i < cnt - 1 && g_lineVi + 6 <= (unsigned)(SMOOTH_MAX * 6); ++i)
+    {
+        RwOpenGLVertex* v = &lineVerts[g_lineVi];
+        Setup2DVertex(v[0], L[i].x, L[i].y, col);
+        Setup2DVertex(v[1], R[i].x, R[i].y, col);
+        Setup2DVertex(v[2], L[i + 1].x, L[i + 1].y, col);
+        v[3] = v[1];
+        Setup2DVertex(v[4], R[i + 1].x, R[i + 1].y, col);
+        v[5] = v[2];
+        g_lineVi += 6;
+    }
+}
+
 static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float* dist = NULL)
 {
     void* player = FindPlayerPed(-1);
@@ -727,86 +811,74 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
         return;
     }
 
-    for(int i = 0; i < good; ++i)
-    {
-        CVector2D nodePos = pts[i];
-        if(g_mapMode)
-        {
-            CVector2D rp;
-            TransformRealWorldPointToRadarSpace(rp, nodePos);
-            LimitRadarPoint(rp);
-            TransformRadarPointToScreenSpace(radarPts[i], rp);
-            radarPts[i].x *= mapScale;
-            radarPts[i].y *= mapScale;
-        }
-        else TransformRealWorldPointToRadarSpace(radarPts[i], nodePos);
-    }
     if(g_logNow) Dbg("DoPathDraw: good nodes=%d", (int)good);
-    if(g_mapMode)
-    {
-        static unsigned s_mapCalls = 0;
-        if(good > 0 && (s_mapCalls < 12 || (s_mapCalls % 90) == 0))
-            Dbg("MAP#%u nodes=%d first=(%.1f %.1f) last=(%.1f %.1f) | scale=%.3f off=(%.1f %.1f) area=(%.1f %.1f) disp=%d mapMode=%d mapScale=%.3f",
-                s_mapCalls, (int)good, radarPts[0].x, radarPts[0].y, radarPts[good - 1].x, radarPts[good - 1].y,
-                At<float>(gMobileMenu, 120), At<float>(gMobileMenu, 124), At<float>(gMobileMenu, 128),
-                At<float>(gMobileMenu, 132), At<float>(gMobileMenu, 136),
-                (int)At<bool>(gMobileMenu, 140), (int)At<bool>(gMobileMenu, 141), mapScale);
-        ++s_mapCalls;
-    }
     if(good < 2) return;
 
     if(!g_bTextInited) { g_bTextInited = true; SetDistanceTextValues(); }
     RwRenderStateSet(rwRENDERSTATETEXTURERASTER, NULL);
 
-    // The scissor rect does not clip in 2.10, so every segment is clipped to the radar disc here
-    // (radar space: the disc has radius 1).
-    const float R = 0.97f;
-    unsigned int vi = 0;
-    for(short i = 0; i < good - 1; i++)
+    static CVector2D s_smooth[SMOOTH_MAX], s_run[SMOOTH_MAX];
+    int ns = SmoothRoute(pts, good, s_smooth, SMOOTH_MAX);
+    if(ns < 2) return;
+    g_lineVi = 0;
+
+    if(g_mapMode)
     {
-        CVector2D P0 = radarPts[i], P1 = radarPts[i + 1];
-        CVector2D S0, S1;
-        if(g_mapMode)
+        for(int i = 0; i < ns; ++i)
         {
-            S0 = P0; S1 = P1;
-            if(fabsf(S1.x - S0.x) + fabsf(S1.y - S0.y) < 1e-4f) continue;
+            CVector2D rp;
+            TransformRealWorldPointToRadarSpace(rp, s_smooth[i]);
+            LimitRadarPoint(rp);
+            TransformRadarPointToScreenSpace(s_run[i], rp);
+            s_run[i].x *= mapScale;
+            s_run[i].y *= mapScale;
         }
-        else
+        AppendRibbon(s_run, ns, color, lineWidth);
+    }
+    else
+    {
+        // The scissor rect does not clip in 2.10, so the curve is cut by the radar disc here
+        // (radar space: the disc has radius 1) and every visible piece becomes its own ribbon.
+        static CVector2D s_radar[SMOOTH_MAX];
+        for(int i = 0; i < ns; ++i) TransformRealWorldPointToRadarSpace(s_radar[i], s_smooth[i]);
+        const float R = 0.97f;
+        int rn = 0;
+        for(int i = 0; i < ns - 1; ++i)
         {
+            CVector2D P0 = s_radar[i], P1 = s_radar[i + 1];
             CVector2D d = { P1.x - P0.x, P1.y - P0.y };
             float qa = d.x * d.x + d.y * d.y;
-            if(qa < 1e-9f) continue;
+            if(qa < 1e-12f) continue;
             float qb = P0.x * d.x + P0.y * d.y;
             float qc = P0.x * P0.x + P0.y * P0.y - R * R;
             float disc = qb * qb - qa * qc;
-            if(disc <= 0.0f) continue;
-            float sq = sqrtf(disc);
-            float t0 = (-qb - sq) / qa, t1 = (-qb + sq) / qa;
-            if(t0 < 0.0f) t0 = 0.0f;
-            if(t1 > 1.0f) t1 = 1.0f;
-            if(t0 >= t1) continue;
+            float t0 = 1.0f, t1 = 0.0f;
+            if(disc > 0.0f)
+            {
+                float sq = sqrtf(disc);
+                t0 = (-qb - sq) / qa; t1 = (-qb + sq) / qa;
+                if(t0 < 0.0f) t0 = 0.0f;
+                if(t1 > 1.0f) t1 = 1.0f;
+            }
+            if(t0 >= t1) { AppendRibbon(s_run, rn, color, lineWidth); rn = 0; continue; }   // segment is outside the disc
             CVector2D Q0 = { P0.x + d.x * t0, P0.y + d.y * t0 }, Q1 = { P0.x + d.x * t1, P0.y + d.y * t1 };
+            CVector2D S0, S1;
             TransformRadarPointToScreenSpace(S0, Q0);
             TransformRadarPointToScreenSpace(S1, Q1);
+            if(t0 > 1e-4f) { AppendRibbon(s_run, rn, color, lineWidth); rn = 0; }            // entered the disc in the middle of the segment
+            if(rn == 0) s_run[rn++] = S0;
+            if(rn < SMOOTH_MAX) s_run[rn++] = S1;
+            if(t1 < 1.0f - 1e-4f) { AppendRibbon(s_run, rn, color, lineWidth); rn = 0; }     // left the disc
         }
-        float angle = atan2f(S1.y - S0.y, S1.x - S0.x);
-        CVector2D o0 = { cosf(angle - 1.5707963f) * lineWidth, sinf(angle - 1.5707963f) * lineWidth };
-        CVector2D o1 = { cosf(angle + 1.5707963f) * lineWidth, sinf(angle + 1.5707963f) * lineWidth };
-        RwOpenGLVertex* v = &lineVerts[vi];
-        Setup2DVertex(v[0], S0.x + o0.x, S0.y + o0.y, color);
-        Setup2DVertex(v[1], S1.x + o0.x, S1.y + o0.y, color);
-        Setup2DVertex(v[2], S0.x + o1.x, S0.y + o1.y, color);
-        v[3] = v[1];
-        Setup2DVertex(v[4], S1.x + o1.x, S1.y + o1.y, color);
-        v[5] = v[2];
-        vi += 6;
+        AppendRibbon(s_run, rn, color, lineWidth);
     }
-    for(unsigned int off = 0; off < vi; off += 600)
+
+    for(unsigned int off = 0; off < g_lineVi; off += 600)
     {
-        unsigned int n = vi - off < 600 ? vi - off : 600;
+        unsigned int n = g_lineVi - off < 600 ? g_lineVi - off : 600;
         RwIm2DRenderPrimitive(rwPRIMTYPETRILIST, &lineVerts[off], (int)n);
     }
-    if(g_logNow) Dbg("DoPathDraw: drew %u vertices", vi);
+    if(g_logNow) Dbg("DoPathDraw: nodes=%d smooth=%d drew %u vertices", good, ns, g_lineVi);
 }
 
 static bool g_lineDone = false;
