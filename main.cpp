@@ -40,7 +40,7 @@
 #define GPS_LINE_A      255
 
 #define GPS_BUILD "r10"
-MYMODCFGNAME(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r10, DK22Pac & juicermv & RusJJ, gps_config.ini)
+MYMODCFGNAME(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r10, DK22Pac & juicermv & RusJJ, gps_config)
 NEEDGAME(com.rockstargames.gtasa)
 
 /* ------------------------------------------------------------------ */
