@@ -1,17 +1,13 @@
-// GTA:SA GPS -> ARM64 (libGTASA.so 2.10) port, milestone 1.
+// GTA:SA GPS -> ARM64 port for GTA San Andreas Android 2.10 (arm64-v8a), release build.
 //
-// What changed versus the 32-bit 1.2.1 source:
-//  * No GTASA_STRUCTS.h: every game struct is read by raw offsets that were
-//    extracted from the DWARF info of the 64-bit libGTASA.so (see OFF_* below).
-//  * No hardcoded libGTASA.so offsets / PLT hooks: everything is resolved by symbol.
-//  * The block of patches that enlarges the path-node limits and the node
-//    streaming radius is NOT ported yet (those were Thumb-2 patches). Without it
-//    the route is only found over nodes that the game has already streamed in.
-//  * The old PreRenderEnd / InitRenderWare hooks are gone, text and init now live
-//    in the DrawRadarGangOverlay hook.
-//  * Drawing on the pause map is disabled for now (the menu class was rewritten in 2.x).
+// Based on GTASA_GPS 1.2.1 (zlib-style licence, see LICENSE): (c) 2013-2014 Dmitry K., fastman92, 2014 LINK/2012, 2022 RusJJ.
+// This is an ALTERED version, plainly marked as such: the ARM64 port, the own route search over the path-node data, the
+// path-node streaming, the pause-map line, the smoothed line renderer and all other new code in this file were written by
+// Claude (an AI assistant made by Anthropic) together with the person who tested and released it.
+// Uses AndroidModLoader (RusJJ, MIT licence, see LICENSE-AML).
 //
-// Offsets marked (UNVERIFIED) were deduced from structs and not yet tested in game.
+// Build with -DGPS_DEBUG to get the gps_debug.txt diagnostics (off in release builds).
+//
 
 #include <mod/amlmod.h>
 #include <mod/logger.h>
@@ -39,8 +35,8 @@
 #define GPS_LINE_B      92
 #define GPS_LINE_A      255
 
-#define GPS_BUILD "r10"
-MYMODCFGNAME(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r10, DK22Pac & juicermv & RusJJ, gps_config)
+#define GPS_BUILD "r13"
+MYMODCFGNAME(net.dk22pac.rusjj.gps, GTA:SA GPS, 1.2.1-arm64-r13, DK22Pac & juicermv & RusJJ, gps_config)   // settings file: gps_config.ini
 NEEDGAME(com.rockstargames.gtasa)
 
 /* ------------------------------------------------------------------ */
@@ -195,9 +191,10 @@ void (*RenderFontBuffer)(void);
 /* ------------------------------------------------------------------ */
 /* Debug log (file in the game's own external dir, always writable)   */
 /* ------------------------------------------------------------------ */
-static FILE* g_dbg = NULL;
 static unsigned g_frame = 0;
 static bool g_logNow = false;
+#ifdef GPS_DEBUG
+static FILE* g_dbg = NULL;
 static void Dbg(const char* fmt, ...)
 {
     if(!g_dbg)
@@ -216,6 +213,9 @@ static void Dbg(const char* fmt, ...)
     va_list a; va_start(a, fmt); vfprintf(g_dbg, fmt, a); va_end(a);
     fputc('\n', g_dbg); fflush(g_dbg);
 }
+#else
+#define Dbg(...) ((void)0)   // release build: no debug file
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -390,6 +390,8 @@ struct RouteCache
     bool boat = false, ok = false, valid = false;
     int n = 0;
     float len = 0.0f;
+    int lastSeg = 0;
+    float cum[MAX_NODE_POINTS];   // length along the route up to every point (2D)
     CVector2D pts[MAX_NODE_POINTS];
 };
 static RouteCache g_routeCache[2];
@@ -516,6 +518,13 @@ static bool AStarRoute(CVector from, CVector to, bool boat, RouteCache& rc)
         rc.pts[out].x = q.x; rc.pts[out].y = q.y; ++out;
     }
     rc.n = out;
+    rc.cum[0] = 0.0f;
+    for(int i = 1; i < out; ++i)
+    {
+        float dx = rc.pts[i].x - rc.pts[i - 1].x, dy = rc.pts[i].y - rc.pts[i - 1].y;
+        rc.cum[i] = rc.cum[i - 1] + sqrtf(dx * dx + dy * dy);
+    }
+    rc.lastSeg = 0;
     rc.len = s_g[goalId];
     rc.startId = startId; rc.goalId = goalId;
     return true;
@@ -544,6 +553,8 @@ static int CountMissingRegions(float minX, float maxX, float minY, float maxY, f
     return missing;
 }
 
+static inline bool PointRegionLoaded(float x, float y) { return RegionNodes(RegionIdx(y) * 8 + RegionIdx(x)) != NULL; }
+
 static void RequestNodesFor(CVector a, CVector b)
 {
     (void)a; (void)b;
@@ -554,7 +565,9 @@ static void RequestNodesFor(CVector a, CVector b)
     // Always ask for the whole map: a long route can leave the box between player and target
     // (detours), and the node data of the whole world is only a few megabytes.
     const float minX = -3000.0f, maxX = 3000.0f, minY = -3000.0f, maxY = 3000.0f;
-    if(!s_reqActive || s_tick - s_lastReq > 240)
+    bool anyMissing = LoadedSignature() != ~0ULL;
+    // The request is lost when a save is loaded or the game resets its streaming, so ask again whenever regions are missing.
+    if(!s_reqActive || s_tick - s_lastReq > 240 || (anyMissing && s_tick - s_lastReq > 20))
     {
         PathMakeRequest((uintptr_t)ThePaths, minX, maxX, minY, maxY);
         s_lastReq = s_tick; s_reqActive = true;
@@ -576,12 +589,14 @@ static void RequestNodesFor(CVector a, CVector b)
         {
             s_lastForce = s_tick;
             uint64_t before = LoadedSignature();
+            PathMakeRequest((uintptr_t)ThePaths, minX, maxX, minY, maxY);
+            s_lastReq = s_tick;
             PathUpdateStreaming((uintptr_t)ThePaths, false);
             StreamLoadAll(false);
             uint64_t after = LoadedSignature();
             if(after == before)
             {
-                if(++s_noProgress >= 3) { s_idleUntil = s_tick + 1500; s_noProgress = 0; } // the rest has no node data (sea), stop pushing
+                if(++s_noProgress >= 3) { s_idleUntil = s_tick + 300; s_noProgress = 0; } // the rest has no node data (sea), stop pushing
             }
             else s_noProgress = 0;
             if(s_forceLogs < 80)
@@ -677,6 +692,35 @@ static void AppendRibbon(const CVector2D* P, int n, RGBA col, float hw)
     }
 }
 
+// Distance still to drive: the player's position is projected onto the cached route every frame, so the number under
+// the radar changes smoothly instead of jumping each time the nearest path node changes.
+static float RemainingAlongRoute(RouteCache& rc, CVector from)
+{
+    int n = rc.n;
+    if(n < 2) return rc.len;
+    float bestD2 = 1e30f, bestRem = rc.len;
+    int bestSeg = rc.lastSeg;
+    for(int pass = 0; pass < 2; ++pass)
+    {
+        int i0 = 0, i1 = n - 2;
+        if(pass == 0) { i0 = rc.lastSeg - 6 < 0 ? 0 : rc.lastSeg - 6; i1 = rc.lastSeg + 80 > n - 2 ? n - 2 : rc.lastSeg + 80; }
+        for(int i = i0; i <= i1; ++i)
+        {
+            CVector2D A = rc.pts[i], B = rc.pts[i + 1];
+            float ex = B.x - A.x, ey = B.y - A.y, l2 = ex * ex + ey * ey;
+            if(l2 < 1e-6f) continue;
+            float t = ((from.x - A.x) * ex + (from.y - A.y) * ey) / l2;
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            float dx = from.x - (A.x + ex * t), dy = from.y - (A.y + ey * t);
+            float d2 = dx * dx + dy * dy;
+            if(d2 < bestD2) { bestD2 = d2; bestSeg = i; bestRem = (rc.cum[n - 1] - rc.cum[i]) - t * sqrtf(l2) + sqrtf(d2); }
+        }
+        if(pass == 0 && bestD2 < 60.0f * 60.0f) break;   // found it near the last position, no need to scan the whole route
+    }
+    rc.lastSeg = bestSeg;
+    return bestRem;
+}
+
 static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float* dist = NULL)
 {
     void* player = FindPlayerPed(-1);
@@ -691,6 +735,7 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
 
     if(bLongRoutes) RequestNodesFor(from, to);
 
+#ifdef GPS_DEBUG
     {
         static int s_statLogs = 0;
         static uint64_t s_lastStatSig = 0;
@@ -714,10 +759,18 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
         }
     }
 
+#endif
     // 1) our own search (no node limits, works over every loaded region)
     bool haveRoute = false;
     if(bLongRoutes)
     {
+        // While the road data around the start or the target is not in memory the search could only reach the
+        // nearest loaded node and would draw a wrong, truncated line: draw nothing until the data is loaded.
+        if(!PointRegionLoaded(from.x, from.y) || !PointRegionLoaded(to.x, to.y))
+        {
+            if(g_logNow || g_mapMode) Dbg("DoPathDraw: road data not loaded yet (start %d, target %d), skipping", (int)PointRegionLoaded(from.x, from.y), (int)PointRegionLoaded(to.x, to.y));
+            return;
+        }
         uint64_t sig = LoadedSignature();
         int sId = -2, gId = -2;
         {
@@ -740,6 +793,7 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
             if(!ok) { rc.startId = sId; rc.goalId = gId; }
             haveRoute = ok;
 
+#ifdef GPS_DEBUG
             if(g_routeLogs < 40)
             {
                 ++g_routeLogs;
@@ -751,6 +805,7 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
                 Dbg("ROUTE#%u mapMode=%d straight=%.0f | own: ok=%d nodes=%d len=%.0f reached=%d start=%d goal=%d | game: nodes=%d dist=%.0f | loadedRegions=%d",
                     g_routeLogs, (int)g_mapMode, straight, (int)ok, ok ? rc.n : 0, ok ? rc.len : 0.0f, g_astarReached, sId, gId, (int)gn, gd, __builtin_popcountll(sig));
             }
+#endif
         }
     }
 
@@ -762,7 +817,7 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
     {
         nodesCount = (short)rc.n;
         good = rc.n;
-        if(dist) *dist = rc.len;
+        if(dist) *dist = RemainingAlongRoute(rc, from);
         gpsDistance = dist ? *dist : gpsDistance;
         // connect the ends: player -> first node and last node -> target (drawing only, the cache stays untouched)
         static CVector2D s_draw[MAX_NODE_POINTS + 2];
@@ -807,7 +862,6 @@ static void DoPathDraw(CVector to, RGBA color, bool isTargetBlip = false, float*
         ClearRadarBlip(g_targetBlip);
         At<int>(gMobileMenu, OFF_MENU_WAYPOINT_BLIP) = 0;
         g_targetBlip = 0;
-        if(PathReleaseRequested && bLongRoutes) PathReleaseRequested((uintptr_t)ThePaths);
         return;
     }
 
@@ -992,6 +1046,7 @@ DECL_HOOKv(DrawRadarGangHook, bool b)
     DoGpsFrame(false);
 }
 
+#ifdef GPS_DEBUG
 // Diagnostics only: where the game itself draws the player arrow on the pause map.
 DECL_HOOKv(YouAreHereHook, float x, float y)
 {
@@ -1012,6 +1067,7 @@ DECL_HOOKv(YouAreHereHook, float x, float y)
             At<float>(gMobileMenu, 132), At<float>(gMobileMenu, 136), (int)At<bool>(gMobileMenu, 140), (int)At<bool>(gMobileMenu, 141));
     }
 }
+#endif
 
 DECL_HOOKv(DrawRadarHook)
 {
@@ -1020,7 +1076,9 @@ DECL_HOOKv(DrawRadarHook)
     g_pMissionTrace = NULL;
     DrawRadarHook();
     ++g_frame;
+#ifdef GPS_DEBUG
     g_logNow = (g_frame % 180) == 1;
+#endif
     if(g_frame == 1) Dbg("hook called for the first time");
 
     if(!EnsureInit()) return;
@@ -1104,6 +1162,7 @@ extern "C" void OnModLoad()
         cfg->Save();
     }
 
+    cfg->Bind("Port", "", "About")->SetString("ARM64 port (2.10): written by Claude (Anthropic AI)");
     cfg->Bind("Author", "", "About")->SetString("[-=KILL MAN=-]");
     cfg->Bind("IdeasFrom", "", "About")->SetString("DK22Pac, JuniorDjjr, juicermv");
     cfg->Bind("Discord", "", "About")->SetString("https://discord.gg/2MY7W39kBg");
@@ -1174,10 +1233,12 @@ extern "C" void OnModLoad()
     }
     HOOK(DrawRadarHook, radarHud);
     HOOK(DrawRadarGangHook, gangOverlay);
+#ifdef GPS_DEBUG
     // Diagnostics only. The symbol is not in the dynamic table, so use its address from the 2.10 arm64 build.
     uintptr_t arrowFn = aml->GetSym(hGTASA, "_ZN6CRadar21DrawYouAreHereSpriteEff");
     if(!arrowFn && pGTASA) arrowFn = pGTASA + 0x5262A0;
     if(arrowFn) HOOK(YouAreHereHook, arrowFn);
+#endif
     Dbg("loaded: ThePaths=%p gMobileMenu=%p RsGlobal=%p trace=%p widgets=%p pickups=%p DoPathSearch=%p hook=%p",
         ThePaths, gMobileMenu, RsGlobal, pRadarTrace, aWidgets, aPickUps, (void*)DoPathSearch, (void*)radarHud);
 
